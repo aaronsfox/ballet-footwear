@@ -18,7 +18,10 @@
 # =========================================================================
 
 import os
+import gzip
+import json
 import warnings
+from datetime import datetime
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
@@ -37,8 +40,12 @@ from scipy.signal import find_peaks
 # Set paths relative to this script so it runs from any working directory
 code_dir = os.path.dirname(os.path.abspath(__file__))
 data_path = os.path.join(code_dir, '..', 'data')
-checks_path = os.path.join(code_dir, '..', '.checks')
 labels_path = os.path.join(code_dir, '..', 'info', 'testing_labels.csv')
+
+# Processed results path
+# Each shoe gets its own folder containing its processed data file and the check
+# figures for its processing; summary figures across shoes sit in the top level
+processed_path = os.path.join(code_dir, '..', 'processed')
 
 # Analysis settings
 # -------------------------------------------------------------------------
@@ -332,18 +339,18 @@ def calculate_bending_geometry(test_data, lever_arm, applicator_offset):
 
 # Function to read in and extract data from degradation test
 # -------------------------------------------------------------------------
-def analyse_degradation_test(filename, shoe_info):
+def analyse_degradation_test(shoe_info):
 
     """
-    Analyses a single degradation test file and saves check figures to the
-    .checks folder.
+    Analyses a single degradation test. Saves the processed data file and check
+    figures to the shoe's folder in the processed folder (processed/<id>/).
 
     Inputs:
-        filename: name of the test file in the data folder
-        shoe_info: row from testing_labels.csv for this test, with the
-            clamp_pos_per, applicator_pos_per, shank_length and
-            applicator_offset_mm set-up measurements. Clamp and applicator
-            positions are percentages of shank length measured from the toe.
+        shoe_info: row from testing_labels.csv for this test, with the id
+            (raw data file is <id>_test_raw.csv), and the clamp_pos_per,
+            applicator_pos_per, shank_length and applicator_offset_mm set-up
+            measurements. Clamp and applicator positions are percentages of
+            shank length measured from the toe.
 
     Returns:
         test_data: sample-level data (with Cycle_ID and Phase), with seating
@@ -352,14 +359,15 @@ def analyse_degradation_test(filename, shoe_info):
             normalised values)
     """
 
+    # Get shoe ID for naming and raw data file
+    filelabel = shoe_info['id']
+    filename = f'{filelabel}_test_raw.csv'
+
     # Read in file
     test_data = read_test_file(os.path.join(data_path, filename))
 
-    # Get file label for naming
-    filelabel = os.path.splitext(filename)[0]
-
-    # Create folder in .checks for this sample
-    check_dir = os.path.join(checks_path, filelabel)
+    # Create folder in processed folder for this shoe
+    check_dir = os.path.join(processed_path, filelabel)
     os.makedirs(check_dir, exist_ok=True)
 
     # Identify full cycles (i.e. bending and relaxation)
@@ -414,7 +422,7 @@ def analyse_degradation_test(filename, shoe_info):
     ax.set_ylim(-0.1, check_data['Displacement'].max() +0.1)
     ax.legend(loc='lower right', framealpha=0.7, facecolor='white', edgecolor='gray')
     ax.set_title(f'{filelabel} Cycle Identification (first 10 cycles)', fontsize=12, fontweight='bold', pad=20)
-    # Save to checks folder
+    # Save to processed folder
     fig.savefig(os.path.join(check_dir,f'{filelabel}_cycle-id.png'),
                 format='png',dpi=150)
     # Close figure
@@ -458,7 +466,7 @@ def analyse_degradation_test(filename, shoe_info):
     ax.set_ylim(0.60, 1.10)
     ax.set_ylabel('Normalised Peak Force', fontsize=12, fontweight='bold', labelpad=10)
     ax.set_title(f'{filelabel} Normalised Peak Force Drop', fontsize=12, fontweight='bold', pad=20)
-    # Save to checks folder
+    # Save to processed folder
     fig.savefig(os.path.join(check_dir, f'{filelabel}_normalised-peak-force.png'),
                 format='png', dpi=150)
     # Close figure
@@ -580,7 +588,7 @@ def analyse_degradation_test(filename, shoe_info):
     ax.set_ylabel(f'Load Onset {onset_units}', fontsize=12, fontweight='bold', labelpad=10)
     ax.set_title(f'{filelabel} Load Onset', fontsize=12, fontweight='bold', pad=20)
     ax.legend(loc='lower right', markerscale=4)
-    # Save to checks folder
+    # Save to processed folder
     fig.savefig(os.path.join(check_dir, f'{filelabel}_load-onset.png'),
                 format='png', dpi=150)
     # Close figure
@@ -609,7 +617,7 @@ def analyse_degradation_test(filename, shoe_info):
     axes[0].set_ylabel('Normalised Stiffness\n(Force vs. Displacement)', fontsize=12, fontweight='bold', labelpad=10)
     axes[1].set_ylabel('Normalised Stiffness\n(Moment vs. Bend Angle)', fontsize=12, fontweight='bold', labelpad=10)
     axes[0].set_title(f'{filelabel} Normalised Stiffness Drop', fontsize=12, fontweight='bold', pad=20)
-    # Save to checks folder
+    # Save to processed folder
     fig.savefig(os.path.join(check_dir, f'{filelabel}_normalised-stiffness.png'),
                 format='png', dpi=150)
     # Close figure
@@ -653,7 +661,7 @@ def analyse_degradation_test(filename, shoe_info):
     ax.set_ylabel('Normalised Force (Baseline Peak Force)', fontsize=12, fontweight='bold', labelpad=10)
     ax.set_title(f'{filelabel} Normalised Hysteresis Loop (every {hysteresis_cycle_step} cycles)',
                  fontsize=12, fontweight='bold', pad=20)
-    # Save to checks folder
+    # Save to processed folder
     fig.savefig(os.path.join(check_dir, f'{filelabel}_normalised-hysteresis-loop.png'),
                 format='png', dpi=150)
     # Close figure
@@ -683,7 +691,7 @@ def analyse_degradation_test(filename, shoe_info):
         ax.set_title(f'{filelabel} Moment vs. Bend Angle (every {hysteresis_cycle_step} cycles; '
                      f'starting angle {start_angle:.1f} deg)', fontsize=12, fontweight='bold', pad=20)
         ax.legend(loc='upper left')
-        # Save to checks folder
+        # Save to processed folder
         fig.savefig(os.path.join(check_dir, f'{filelabel}_moment-bend-angle.png'),
                     format='png', dpi=150)
         # Close figure
@@ -693,7 +701,146 @@ def analyse_degradation_test(filename, shoe_info):
         # > This is the integral of the displacement phase, minus the integral of the relaxation phase
         #   Gives the area of the hysteresis loop
 
+    # Save processed data
+    # -------------------------------------------------------------------------
+    setup = {'lever_arm_mm': lever_arm,
+             'starting_angle_deg': start_angle if has_angle else None,
+             'n_cycles_recorded': int(incomplete_cycle_id)}
+    save_processed_data(os.path.join(check_dir, f'{filelabel}_processed.json.gz'),
+                        shoe_info, setup, test_data, peak_force)
+
     return test_data, peak_force
+
+# Functions to save and load processed data
+# -------------------------------------------------------------------------
+
+# Sample-level variables saved per cycle, with units and rounding (decimal places)
+# Rounding matches the precision of the raw data (time, displacement, force) and
+# keeps derived values well below measurement resolution
+processed_sample_variables = {
+    'Time': ('s', 4),
+    'Displacement': ('mm', 4),
+    'Force': ('N', 4),
+    'True_Force': ('N', 4),
+    'Angle': ('deg', 4),
+    'Bend_Angle': ('deg', 4),
+    'Moment': ('Nm', 5),
+}
+
+# Units of cycle-level results (normalised values and ratios are unitless)
+processed_cycle_units = {
+    'Force': 'N', 'True_Force': 'N', 'Moment': 'Nm',
+    'Low_Stiffness': 'N/mm', 'High_Stiffness': 'N/mm',
+    'Low_Angular_Stiffness': 'Nm/deg', 'High_Angular_Stiffness': 'Nm/deg',
+    'Load_Onset_Displacement': 'mm', 'Load_Onset_Bend_Angle': 'deg', 'Unloaded_Force': 'N',
+}
+
+def _to_json_value(value):
+
+    """Converts numpy/pandas values to JSON-compatible values (NaN -> None)."""
+
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        return None if np.isnan(value) else float(value)
+    return value
+
+def save_processed_data(filepath, shoe_info, setup, test_data, peak_force):
+
+    """
+    Saves the processed data for a shoe as a single gzip-compressed JSON file.
+
+    The file contains:
+        id, generated (timestamp), source_file
+        shoe: the shoe's row from testing_labels.csv
+        setup: derived set-up values (lever arm, starting angle, cycles recorded)
+        settings: analysis settings used
+        units: units of sample-level variables and cycle-level results
+        cycles: list of analysed cycles, each with
+            cycle_id
+            results: cycle-level results (peak values, stiffness, load onset and
+                normalised values)
+            data: sample-level arrays (time, displacement, raw vertical force,
+                true force, angle, bend angle, moment and phase)
+
+    Missing values (NaN) are saved as null. Seating cycles and the final
+    incomplete cycle are not included. Use load_processed_data() to read the
+    file back into dataframes.
+    """
+
+    # Collate cycle-level results and sample-level data per cycle
+    results_by_cycle = peak_force.set_index('Cycle_ID')
+    cycles = []
+    for cycle, cycle_data in test_data.groupby('Cycle_ID'):
+        data = {}
+        for var, (_, decimals) in processed_sample_variables.items():
+            values = cycle_data[var].round(decimals).to_numpy()
+            data[var] = [None if np.isnan(v) else float(v) for v in values] \
+                if np.isnan(values).any() else values.tolist()
+        data['Phase'] = cycle_data['Phase'].astype(int).tolist()
+        cycles.append({
+            'cycle_id': int(cycle),
+            'results': {key: _to_json_value(val) for key, val in results_by_cycle.loc[cycle].items()},
+            'data': data,
+        })
+
+    # Collate file contents
+    processed = {
+        'id': shoe_info['id'],
+        'generated': datetime.now().isoformat(timespec='seconds'),
+        'source_file': f'{shoe_info["id"]}_test_raw.csv',
+        'shoe': {key: _to_json_value(val) for key, val in shoe_info.items()},
+        'setup': {key: _to_json_value(val) for key, val in setup.items()},
+        'settings': {
+            'min_prominence_mm': min_prominence,
+            'hold_tolerance_mm': hold_tolerance,
+            'n_seating_cycles': n_seating_cycles,
+            'n_baseline_cycles': n_baseline_cycles,
+            'displacement_windows_mm': {'low': [low_stiffness_start, low_stiffness_end],
+                                        'high': [high_stiffness_start, high_stiffness_end]},
+            'bend_angle_windows_deg': {'low': [low_bend_start, low_bend_end],
+                                       'high': [high_bend_start, high_bend_end]},
+            'load_onset_threshold_N': load_onset_threshold,
+            'loaded_at_start_tolerance_mm': loaded_at_start_tolerance,
+        },
+        'units': {
+            'data': {var: units for var, (units, _) in processed_sample_variables.items()} |
+                    {'Phase': '1 = bending (incl. hold), -1 = relaxing'},
+            'results': processed_cycle_units,
+        },
+        'cycles': cycles,
+    }
+
+    # Save as compressed JSON
+    with gzip.open(filepath, 'wt', encoding='utf-8', compresslevel=6) as file:
+        json.dump(processed, file, separators=(',', ':'))
+
+def load_processed_data(shoe_id):
+
+    """
+    Loads a shoe's processed data file (see save_processed_data()).
+
+    Returns:
+        info: dictionary of file metadata (id, shoe, setup, settings, units)
+        sample_data: dataframe of sample-level data with Cycle_ID
+        cycle_results: dataframe of cycle-level results with Cycle_ID
+    """
+
+    # Read file
+    filepath = os.path.join(processed_path, shoe_id, f'{shoe_id}_processed.json.gz')
+    with gzip.open(filepath, 'rt', encoding='utf-8') as file:
+        processed = json.load(file)
+
+    # Build sample-level and cycle-level dataframes
+    sample_data = pd.concat([pd.DataFrame(cycle['data']).assign(Cycle_ID=cycle['cycle_id'])
+                             for cycle in processed['cycles']], ignore_index=True)
+    cycle_results = pd.DataFrame([{'Cycle_ID': cycle['cycle_id']} | cycle['results']
+                                  for cycle in processed['cycles']])
+    info = {key: val for key, val in processed.items() if key != 'cycles'}
+
+    return info, sample_data, cycle_results
 
 
 # =========================================================================
@@ -715,18 +862,18 @@ if __name__ == '__main__':
     print(f'Analysing {len(included_tests)} included tests (excluded: {", ".join(excluded_ids)})')
 
     # Loop through included tests and store results
-    # Results are stored in a dictionary keyed by file label, each containing
+    # Results are stored in a dictionary keyed by shoe ID, each containing
     # the sample-level data ('data') and cycle-level results ('peak_force')
+    # Processed data and check figures for each shoe are saved to processed/<id>/
     results = {}
     for _, shoe_info in included_tests.iterrows():
         filename = f'{shoe_info["id"]}_test_raw.csv'
-        filelabel = os.path.splitext(filename)[0]
         if not os.path.exists(os.path.join(data_path, filename)):
             warnings.warn(f'{filename} not found in data folder; skipping')
             continue
         print(f'Analysing {filename}...')
-        test_data, peak_force = analyse_degradation_test(filename, shoe_info)
-        results[filelabel] = {'data': test_data, 'peak_force': peak_force}
+        test_data, peak_force = analyse_degradation_test(shoe_info)
+        results[shoe_info['id']] = {'data': test_data, 'peak_force': peak_force}
         print(f'  {len(peak_force)} cycles analysed; final normalised peak force = '
               f'{peak_force["Normalised_Force"].iloc[-1]:.3f}')
 
@@ -759,8 +906,8 @@ if __name__ == '__main__':
     ax.set_title('Moment vs. Bend Angle During Bending (solid = first analysed cycle; dashed = last cycle)',
                  fontsize=12, fontweight='bold', pad=20)
     ax.legend(loc='upper left', ncol=2)
-    # Save to checks folder
-    fig.savefig(os.path.join(checks_path, 'summary_moment-bend-angle.png'),
+    # Save to processed folder
+    fig.savefig(os.path.join(processed_path, 'summary_moment-bend-angle.png'),
                 format='png', dpi=150)
     # Close figure
     plt.close('all')
@@ -789,8 +936,8 @@ if __name__ == '__main__':
     ax.set_ylabel('Load Onset Bend Angle from Starting Shape (deg)', fontsize=12, fontweight='bold', labelpad=10)
     ax.set_title('Load Onset Across Cycles', fontsize=12, fontweight='bold', pad=20)
     ax.legend(loc='upper left', ncol=2, fontsize=8)
-    # Save to checks folder
-    fig.savefig(os.path.join(checks_path, 'summary_load-onset.png'),
+    # Save to processed folder
+    fig.savefig(os.path.join(processed_path, 'summary_load-onset.png'),
                 format='png', dpi=150)
     # Close figure
     plt.close('all')
@@ -810,10 +957,10 @@ if __name__ == '__main__':
 
     # Uncomment to run (requires act_2 and bloch_3 to have been analysed above)
     # from scipy.signal import medfilt
-    # act_2_data = results['act_2_test_raw']['data']
-    # act_2_peak_force = results['act_2_test_raw']['peak_force']
-    # bloch_3_data = results['bloch_3_test_raw']['data']
-    # bloch_3_peak_force = results['bloch_3_test_raw']['peak_force']
+    # act_2_data = results['act_2']['data']
+    # act_2_peak_force = results['act_2']['peak_force']
+    # bloch_3_data = results['bloch_3']['data']
+    # bloch_3_peak_force = results['bloch_3']['peak_force']
     act_col = '#333631'
     bloch_col ='#a57463'
 
