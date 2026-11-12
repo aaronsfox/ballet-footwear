@@ -17,11 +17,11 @@
 # Import packages
 # =========================================================================
 
+import io
 import os
 import gzip
 import json
 import warnings
-from datetime import datetime
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
@@ -753,7 +753,7 @@ def save_processed_data(filepath, shoe_info, setup, test_data, peak_force):
     Saves the processed data for a shoe as a single gzip-compressed JSON file.
 
     The file contains:
-        id, generated (timestamp), source_file
+        id, source_file
         shoe: the shoe's row from testing_labels.csv
         setup: derived set-up values (lever arm, starting angle, cycles recorded)
         settings: analysis settings used
@@ -789,7 +789,6 @@ def save_processed_data(filepath, shoe_info, setup, test_data, peak_force):
     # Collate file contents
     processed = {
         'id': shoe_info['id'],
-        'generated': datetime.now().isoformat(timespec='seconds'),
         'source_file': f'{shoe_info["id"]}_test_raw.csv',
         'shoe': {key: _to_json_value(val) for key, val in shoe_info.items()},
         'setup': {key: _to_json_value(val) for key, val in setup.items()},
@@ -813,9 +812,14 @@ def save_processed_data(filepath, shoe_info, setup, test_data, peak_force):
         'cycles': cycles,
     }
 
-    # Save as compressed JSON
-    with gzip.open(filepath, 'wt', encoding='utf-8', compresslevel=6) as file:
-        json.dump(processed, file, separators=(',', ':'))
+    # Save as compressed JSON, overwriting any existing file
+    # The gzip timestamp is fixed (mtime=0) and no run timestamp is stored, so
+    # re-running with unchanged results produces an identical file (i.e. git
+    # only sees a change when the processed results actually change)
+    with open(filepath, 'wb') as raw_file:
+        with gzip.GzipFile(filename='', mode='wb', fileobj=raw_file, compresslevel=6, mtime=0) as gz_file:
+            with io.TextIOWrapper(gz_file, encoding='utf-8') as file:
+                json.dump(processed, file, separators=(',', ':'))
 
 def load_processed_data(shoe_id):
 
