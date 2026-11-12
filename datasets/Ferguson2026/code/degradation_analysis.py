@@ -81,6 +81,17 @@ low_bend_end = 8.0
 high_bend_start = 11.0
 high_bend_end = 14.0
 
+# Load onset detection
+# Load onset is where the shoe starts carrying load during bending, taken as the
+# first sample where force rises load_onset_threshold (N) above the cycle's
+# minimum force before peak. A relative threshold is used as the unloaded force
+# reading is not always zero (e.g. ~-2.4 N in bloch_6, ~+0.9 N in bloch-u_3).
+# If onset occurs within loaded_at_start_tolerance (mm) of the start of the
+# cycle, the shoe was already carrying load at the bottom of the stroke and the
+# true onset is below the tested range (flagged as Loaded_At_Cycle_Start).
+load_onset_threshold = 0.5
+loaded_at_start_tolerance = 0.5
+
 # Spacing of cycles plotted on the hysteresis loop figure
 hysteresis_cycle_step = 50
 
@@ -230,6 +241,45 @@ def calculate_window_stiffness(displacement, force, window_start, window_end):
     slope = np.polyfit(displacement[in_window], force[in_window], 1)[0]
 
     return slope
+
+# Function to identify load onset within a cycle
+# -------------------------------------------------------------------------
+def calculate_load_onset(displacement, force):
+
+    """
+    Identifies where the shoe starts carrying load during the bending phase of
+    a cycle (see load onset settings above).
+
+    Returns the load onset position as a fractional index within the arrays
+    (interpolated between the samples either side of the threshold, as samples
+    are ~0.1 deg apart), the minimum (unloaded) force before peak, and whether
+    the shoe was already carrying load at the start of the cycle.
+    """
+
+    # Find the minimum force before peak force as the unloaded reference
+    peak_ind = np.argmax(force)
+    min_ind = np.argmin(force[:peak_ind + 1])
+    min_force = force[min_ind]
+
+    # Find first sample after the minimum where force exceeds the threshold
+    above = np.where(force[min_ind:peak_ind + 1] >= min_force + load_onset_threshold)[0]
+    if len(above) == 0:
+        return None, min_force, False
+    onset_ind = min_ind + above[0]
+
+    # Interpolate between the samples either side of the threshold crossing
+    threshold = min_force + load_onset_threshold
+    if onset_ind > min_ind and force[onset_ind] > force[onset_ind - 1]:
+        fraction = (threshold - force[onset_ind - 1]) / (force[onset_ind] - force[onset_ind - 1])
+        onset_pos = onset_ind - 1 + np.clip(fraction, 0.0, 1.0)
+    else:
+        onset_pos = float(onset_ind)
+
+    # Check whether onset is at the start of the cycle (i.e. already loaded)
+    onset_disp = np.interp(onset_pos, np.arange(len(displacement)), displacement)
+    loaded_at_start = (onset_disp - displacement[0]) < loaded_at_start_tolerance
+
+    return onset_pos, min_force, loaded_at_start
 
 # Function to calculate bending angle, true force and moment
 # -------------------------------------------------------------------------
@@ -472,6 +522,70 @@ def analyse_degradation_test(filename, shoe_info):
     peak_force['Relative_Stiffness'] = peak_force['High_Stiffness'] / peak_force['Low_Stiffness']
     peak_force['Relative_Angular_Stiffness'] = peak_force['High_Angular_Stiffness'] / peak_force['Low_Angular_Stiffness']
 
+    # Calculate load onset across cycles
+    # This identifies where the shoe starts carrying load in each cycle (see load
+    # onset settings above). As the bend angle is measured from the shoe's original
+    # starting shape, increases in load onset angle across cycles indicate the shoe
+    # is not returning to its starting shape (i.e. retained bend).
+    # -------------------------------------------------------------------------
+
+    # Create lists to store load onset values
+    onset_displacement = []
+    onset_angle = []
+    onset_min_force = []
+    onset_loaded_at_start = []
+
+    # Loop through cycles to identify load onset during bending
+    for cycle, cycle_data in bending_data.groupby('Cycle_ID'):
+        displacement = cycle_data['Displacement'].to_numpy()
+        onset_ind, min_force, loaded_at_start = calculate_load_onset(displacement,
+                                                                     cycle_data['Force'].to_numpy())
+        onset_min_force.append(min_force)
+        onset_loaded_at_start.append(loaded_at_start)
+        if onset_ind is None:
+            onset_displacement.append(np.nan)
+            onset_angle.append(np.nan)
+        else:
+            sample_inds = np.arange(len(displacement))
+            onset_displacement.append(np.interp(onset_ind, sample_inds, displacement))
+            onset_angle.append(np.interp(onset_ind, sample_inds, cycle_data['Bend_Angle'].to_numpy()))
+
+    # Store load onset values
+    peak_force['Load_Onset_Displacement'] = onset_displacement
+    peak_force['Load_Onset_Bend_Angle'] = onset_angle
+    peak_force['Unloaded_Force'] = onset_min_force
+    peak_force['Loaded_At_Cycle_Start'] = onset_loaded_at_start
+
+    # Report proportion of cycles where the shoe was already loaded at the start of the cycle
+    n_loaded_at_start = int(np.sum(onset_loaded_at_start))
+    if n_loaded_at_start > 0:
+        print(f'  Loaded at cycle start (load onset below tested range) in {n_loaded_at_start} '
+              f'of {len(onset_loaded_at_start)} cycles')
+
+    # Visualise load onset change
+    # Cycles where the shoe was already loaded at the start are shown in grey, as
+    # the true onset is below the tested range for these
+    onset_var, onset_units = ('Load_Onset_Bend_Angle', 'Bend Angle from Starting Shape (deg)') if has_angle \
+        else ('Load_Onset_Displacement', 'Displacement (mm)')
+    loaded_mask = peak_force['Loaded_At_Cycle_Start'].to_numpy()
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(15, 8))
+    ax.scatter(peak_force.loc[~loaded_mask, 'Cycle_ID'], peak_force.loc[~loaded_mask, onset_var],
+               s=4, color='purple', label='Load Onset')
+    ax.scatter(peak_force.loc[loaded_mask, 'Cycle_ID'], peak_force.loc[loaded_mask, onset_var],
+               s=4, color='grey', label='Loaded at Cycle Start (onset below tested range)')
+    # Set limits and labels
+    ax.set_xlim(0, test_data['Cycle_ID'].max())
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel('Cycle ID', fontsize=12, fontweight='bold', labelpad=10)
+    ax.set_ylabel(f'Load Onset {onset_units}', fontsize=12, fontweight='bold', labelpad=10)
+    ax.set_title(f'{filelabel} Load Onset', fontsize=12, fontweight='bold', pad=20)
+    ax.legend(loc='lower right', markerscale=4)
+    # Save to checks folder
+    fig.savefig(os.path.join(check_dir, f'{filelabel}_load-onset.png'),
+                format='png', dpi=150)
+    # Close figure
+    plt.close('all')
+
     # Visualise normalised stiffness change
     # Top panel: displacement windows (N/mm); bottom panel: bend angle windows (Nm/deg)
     fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(15, 12), sharex=True)
@@ -650,6 +764,46 @@ if __name__ == '__main__':
                 format='png', dpi=150)
     # Close figure
     plt.close('all')
+
+    # Summary check of load onset across shoes
+    # -------------------------------------------------------------------------
+
+    # Plots load onset bend angle across cycles for each shoe with a recorded
+    # applicator offset. Cycles where the shoe was already loaded at the start of
+    # the cycle are not shown, as the true onset is below the tested range.
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(15, 8))
+    for ind, (filelabel, result) in enumerate(results.items()):
+        peak_force = result['peak_force']
+        if peak_force['Load_Onset_Bend_Angle'].isna().all():
+            continue
+        onset = peak_force['Load_Onset_Bend_Angle'].where(~peak_force['Loaded_At_Cycle_Start'])
+        pct_loaded = 100 * peak_force['Loaded_At_Cycle_Start'].mean()
+        label = filelabel.replace('_test_raw', '')
+        if pct_loaded > 0:
+            label += f' ({pct_loaded:.0f}% cycles loaded at start)'
+        ax.plot(peak_force['Cycle_ID'], onset, color=colours(ind % 20), lw=1.5, label=label)
+    # Set limits and labels
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel('Cycle ID', fontsize=12, fontweight='bold', labelpad=10)
+    ax.set_ylabel('Load Onset Bend Angle from Starting Shape (deg)', fontsize=12, fontweight='bold', labelpad=10)
+    ax.set_title('Load Onset Across Cycles', fontsize=12, fontweight='bold', pad=20)
+    ax.legend(loc='upper left', ncol=2, fontsize=8)
+    # Save to checks folder
+    fig.savefig(os.path.join(checks_path, 'summary_load-onset.png'),
+                format='png', dpi=150)
+    # Close figure
+    plt.close('all')
+
+    # Print summary of load onset across shoes
+    print('\nLoad onset summary (bend angle from starting shape; first/last analysed cycle):')
+    for filelabel, result in results.items():
+        peak_force = result['peak_force']
+        first, last = peak_force.iloc[0], peak_force.iloc[-1]
+        fmt = lambda row: ('loaded at start' if row['Loaded_At_Cycle_Start']
+                           else f'{row["Load_Onset_Bend_Angle"]:.1f} deg / {row["Load_Onset_Displacement"]:.1f} mm')
+        print(f'  {filelabel.replace("_test_raw", ""):10s} first: {fmt(first):24s} last: {fmt(last):24s} '
+              f'unloaded force first/last: {first["Unloaded_Force"]:.2f}/{last["Unloaded_Force"]:.2f} N')
 
     # Just some test code to produce some plots for act'ble
     # -------------------------------------------------------------------------
