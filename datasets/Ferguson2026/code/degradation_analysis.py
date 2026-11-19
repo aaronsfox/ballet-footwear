@@ -30,6 +30,9 @@ from matplotlib.collections import LineCollection
 import numpy as np
 from scipy.signal import find_peaks
 
+# Trapezoidal integration (np.trapz was renamed np.trapezoid in numpy 2.0)
+_trapezoid = getattr(np, 'trapezoid', None) or np.trapz
+
 # =========================================================================
 # Set-up
 # =========================================================================
@@ -72,21 +75,13 @@ n_seating_cycles = 20
 # avoids the whole curve being shifted by noise in a single cycle.
 n_baseline_cycles = 10
 
-# Displacement windows (mm) for stiffness calculation during bending
-low_stiffness_start = 4.0
-low_stiffness_end = 7.0
-high_stiffness_start = 10.0
-high_stiffness_end = 13.0
-
-# Bend angle windows (degrees) for angular stiffness calculation during bending
-# Bend angle is measured from each shoe's starting shape (i.e. the angle at zero
-# displacement), so the windows represent the same amount of applied bending
-# across shoes with different starting bends. With the current set-up, all shoes
-# with a recorded offset cover roughly 4-14 degrees of bend over the cycle.
-low_bend_start = 5.0
-low_bend_end = 8.0
-high_bend_start = 11.0
-high_bend_end = 14.0
+# Width (degrees of bend) of the angular stiffness windows
+# Low-range stiffness is taken over the first stiffness_window_width degrees after
+# load onset in each cycle, and high-range stiffness over the last
+# stiffness_window_width degrees before peak bend. Referencing the low window to
+# load onset keeps it on the loaded part of the curve as shoes retain bend (fixed
+# windows end up measuring the unloaded stretch in later cycles).
+stiffness_window_width = 3.0
 
 # Load onset detection
 # Load onset is where the shoe starts carrying load during bending, taken as the
@@ -98,6 +93,13 @@ high_bend_end = 14.0
 # true onset is below the tested range (flagged as Loaded_At_Cycle_Start).
 load_onset_threshold = 0.5
 loaded_at_start_tolerance = 0.5
+
+# Load cell zero offset (drift) correction
+# The zero offset is the running median (over zero_offset_window cycles) of the
+# unloaded force reading in cycles where the shoe unloads. At least
+# zero_offset_min_cycles unloaded cycles are needed to estimate it.
+zero_offset_window = 51
+zero_offset_min_cycles = 50
 
 # Spacing of cycles plotted on the hysteresis loop figure
 hysteresis_cycle_step = 50
@@ -322,8 +324,8 @@ def calculate_bending_geometry(test_data, lever_arm, applicator_offset):
         True_Force: force perpendicular to the sole (N)
         Moment: bending moment about the hinge (Nm)
 
-    If applicator_offset is missing (NaN), Angle, Bend_Angle and True_Force are
-    NaN, but Moment is still calculated.
+    A missing applicator offset is replaced with zero (and flagged) before this
+    function is called (see analyse_degradation_test).
     """
 
     # Calculate sole angle and angle relative to starting shape
@@ -387,17 +389,24 @@ def analyse_degradation_test(shoe_info):
 
     # Lever arm (mm) is the horizontal distance from the hinge (clamp) to the applicator
     lever_arm = (shoe_info['applicator_pos_per'] - shoe_info['clamp_pos_per']) / 100 * shoe_info['shank_length']
+
+    # Applicator offset (mm)
+    # If the offset has not been recorded it is assumed to be zero (i.e. no starting
+    # bend) and flagged. Angles, true force and angular stiffness for these shoes will
+    # change once the offset is recorded. Normalised peak true force is largely
+    # unaffected, as the angle at peak is the same every cycle.
     applicator_offset = float(shoe_info['applicator_offset_mm'])
-    has_angle = not np.isnan(applicator_offset)
-    if not has_angle:
-        warnings.warn(f'{filelabel}: applicator offset not recorded; bending angle, true force and '
-                      f'angular stiffness are set to NaN (moment is still calculated)')
+    offset_assumed = bool(np.isnan(applicator_offset))
+    if offset_assumed:
+        applicator_offset = 0.0
+        warnings.warn(f'{filelabel}: applicator offset not recorded; assuming 0 mm (no starting bend). '
+                      f'Angle-based outcomes should be re-processed once the offset is recorded')
 
     # Calculate geometry
     test_data, start_angle = calculate_bending_geometry(test_data, lever_arm, applicator_offset)
-    if has_angle:
-        print(f'  Lever arm = {lever_arm:.1f} mm; starting angle = {start_angle:.1f} deg; '
-              f'bend angle range = {test_data["Bend_Angle"].min():.1f}-{test_data["Bend_Angle"].max():.1f} deg')
+    print(f'  Lever arm = {lever_arm:.1f} mm; starting angle = {start_angle:.1f} deg'
+          f'{" (offset assumed 0)" if offset_assumed else ""}; '
+          f'bend angle range = {test_data["Bend_Angle"].min():.1f}-{test_data["Bend_Angle"].max():.1f} deg')
 
     # Visual check of identification (first 10 cycles)
     # Plot data
@@ -428,7 +437,7 @@ def analyse_degradation_test(shoe_info):
     # Close figure
     plt.close('all')
 
-    # Calculate peak force across cycles
+    # Drop seating and incomplete cycles
     # -------------------------------------------------------------------------
 
     # Drop initial seating cycles from dataset
@@ -440,153 +449,209 @@ def analyse_degradation_test(shoe_info):
     if test_data.empty:
         raise ValueError(f'{filename}: no complete cycles remain after removing {n_seating_cycles} seating cycles')
 
-    # Calculate peak measured force, true force and moment per cycle ID
-    # Note that peak moment is peak measured force multiplied by a constant lever
-    # arm, so normalised peak moment is the same as normalised peak force
-    peak_force = test_data.groupby('Cycle_ID')[['Force', 'True_Force', 'Moment']].max().reset_index()
+    # Calculate cycle-level outcomes
+    # For each cycle this calculates:
+    #   Peak values: peak measured force, true force and moment
+    #   Load onset: where the shoe starts carrying load during bending (see load
+    #       onset settings above). As bend angle is measured from the shoe's original
+    #       starting shape, increases in load onset angle indicate the shoe is not
+    #       returning to its starting shape (i.e. retained bend/deformation)
+    #   Angular stiffness: slope of moment against bend angle (Nm/deg; following
+    #       Oleson et al., 2005) over two windows on the loading curve:
+    #           Low range: the first stiffness_window_width degrees after load onset
+    #           High range: the last stiffness_window_width degrees before peak bend
+    #       Referencing the low window to load onset means it always sits on the
+    #       loaded part of the curve, so stiffness is kept separate from the
+    #       deformation captured by load onset
+    #   Energy: work done by the applicator during bending (input) and returned by
+    #       the shoe during relaxation (returned), from the area under the measured
+    #       force-displacement curve. Energy lost is the hysteresis loop area.
+    #   Hold relaxation: drop in force during the hold at peak displacement
+    # -------------------------------------------------------------------------
 
-    # Normalise each cycles peak values to the baseline (mean of first cycles after seating)
-    baseline_peak_force = peak_force['Force'].iloc[:n_baseline_cycles].mean()
-    peak_force['Normalised_Force'] = peak_force['Force'] / baseline_peak_force
-    peak_force['Normalised_True_Force'] = peak_force['True_Force'] / peak_force['True_Force'].iloc[:n_baseline_cycles].mean()
-    peak_force['Normalised_Moment'] = peak_force['Moment'] / peak_force['Moment'].iloc[:n_baseline_cycles].mean()
+    # Create list to store cycle outcomes
+    cycle_outcomes = []
 
-    # Visualise normalised force change
+    # Loop through cycles
+    for cycle, cycle_data in test_data.groupby('Cycle_ID'):
+
+        # Get cycle arrays
+        displacement = cycle_data['Displacement'].to_numpy()
+        force = cycle_data['Force'].to_numpy()
+        bend_angle = cycle_data['Bend_Angle'].to_numpy()
+        angle = cycle_data['Angle'].to_numpy()
+        moment = cycle_data['Moment'].to_numpy()
+        phase = cycle_data['Phase'].to_numpy()
+
+        # Identify bending (incl. hold) and loading (bending up to first reaching
+        # peak displacement, i.e. excluding the hold) portions of the cycle
+        bend_end = np.where(phase == 1)[0][-1]
+        load_end = np.argmax(displacement[:bend_end + 1] >= displacement[:bend_end + 1].max() - hold_tolerance)
+
+        # Peak values
+        peak_ind = np.argmax(force)
+        outcomes = {
+            'Cycle_ID': cycle,
+            'Force': force[peak_ind],
+            'True_Force': cycle_data['True_Force'].max(),
+            'Moment': moment[peak_ind],
+            'Peak_Force_Angle': angle[peak_ind],
+            'Peak_Bend_Angle': bend_angle[load_end],
+        }
+
+        # Load onset
+        onset_pos, min_force, loaded_at_start = calculate_load_onset(displacement[:bend_end + 1],
+                                                                     force[:bend_end + 1])
+        sample_inds = np.arange(bend_end + 1)
+        outcomes['Unloaded_Force'] = min_force
+        outcomes['Loaded_At_Cycle_Start'] = loaded_at_start
+        if onset_pos is None:
+            outcomes['Load_Onset_Displacement'] = np.nan
+            outcomes['Load_Onset_Bend_Angle'] = np.nan
+        else:
+            outcomes['Load_Onset_Displacement'] = np.interp(onset_pos, sample_inds, displacement[:bend_end + 1])
+            outcomes['Load_Onset_Bend_Angle'] = np.interp(onset_pos, sample_inds, bend_angle[:bend_end + 1])
+
+        # Angular stiffness windows (referenced to load onset and peak bend)
+        low_start = outcomes['Load_Onset_Bend_Angle']
+        high_end = outcomes['Peak_Bend_Angle']
+        windows = {'Low': (low_start, low_start + stiffness_window_width),
+                   'High': (high_end - stiffness_window_width, high_end)}
+        for label, (start, end) in windows.items():
+            outcomes[f'{label}_Window_Start'] = start
+            outcomes[f'{label}_Window_End'] = end
+            outcomes[f'{label}_Angular_Stiffness'] = np.nan if np.isnan(start) else \
+                calculate_window_stiffness(bend_angle[:load_end + 1], moment[:load_end + 1], start, end)
+
+        # Energy input during bending and returned during relaxation (N.mm = mJ)
+        # Raw values are corrected for load cell zero offset after the loop
+        outcomes['Energy_Input_Raw'] = _trapezoid(force[:bend_end + 1], displacement[:bend_end + 1])
+        outcomes['Energy_Returned_Raw'] = -_trapezoid(force[bend_end:], displacement[bend_end:])
+        outcomes['Displacement_Input'] = displacement[bend_end] - displacement[0]
+        outcomes['Displacement_Returned'] = displacement[bend_end] - displacement[-1]
+
+        # Force at the end of the hold (for hold relaxation)
+        outcomes['Hold_End_Force'] = force[bend_end]
+
+        # Append cycle outcomes
+        cycle_outcomes.append(outcomes)
+
+    # Convert to dataframe
+    # (named peak_force for consistency with earlier versions of this script)
+    peak_force = pd.DataFrame(cycle_outcomes)
+
+    # Correct for load cell zero offset (drift)
+    # When the shoe unloads at the bottom of the stroke (i.e. not loaded at cycle
+    # start), the minimum force before peak is the load cell reading with no load,
+    # which is not always zero and can drift over a test. The zero offset is taken
+    # as a running median of these unloaded readings across cycles, interpolated
+    # over cycles where the shoe stayed loaded and held constant beyond the first
+    # and last unloaded cycles. Shoes that never unload (i.e. carry load at the
+    # bottom of every cycle) have no unloaded reading, so no correction is possible
+    # and the offset is set to zero (flagged as Zero_Offset_Estimated = False).
+    # Stiffness slopes, load onset and energy lost are unaffected by a constant offset.
+    # -------------------------------------------------------------------------
+    unloaded = peak_force['Unloaded_Force'].where(~peak_force['Loaded_At_Cycle_Start'].astype(bool))
+    if unloaded.notna().sum() >= zero_offset_min_cycles:
+        smoothed = unloaded.dropna().rolling(zero_offset_window, center=True, min_periods=1).median()
+        zero_offset = np.interp(peak_force['Cycle_ID'], peak_force.loc[smoothed.index, 'Cycle_ID'], smoothed)
+        zero_offset_estimated = True
+        print(f'  Load cell zero offset estimated from {unloaded.notna().sum()} unloaded cycles: '
+              f'{zero_offset[0]:.2f} N (start) to {zero_offset[-1]:.2f} N (end)')
+    else:
+        zero_offset = np.zeros(len(peak_force))
+        zero_offset_estimated = False
+        print(f'  Shoe does not unload within the stroke; no zero offset correction applied')
+    peak_force['Zero_Offset'] = zero_offset
+    peak_force['Zero_Offset_Estimated'] = zero_offset_estimated
+
+    # Corrected peak values
+    # True force is corrected at the angle of peak measured force
+    peak_force['Force_Corrected'] = peak_force['Force'] - peak_force['Zero_Offset']
+    peak_force['True_Force_Corrected'] = peak_force['Force_Corrected'] * np.cos(np.radians(peak_force['Peak_Force_Angle']))
+    peak_force['Moment_Corrected'] = peak_force['Force_Corrected'] * lever_arm / 1000
+
+    # Drift-free force range (peak minus minimum force before peak in the cycle)
+    # This is unaffected by any zero offset, so is used to check whether changes in
+    # peak force in shoes that cannot be corrected are real or due to drift
+    peak_force['Force_Range'] = peak_force['Force'] - peak_force['Unloaded_Force']
+
+    # Corrected energy (mJ) and energy return
+    peak_force['Energy_Input'] = peak_force['Energy_Input_Raw'] - peak_force['Zero_Offset'] * peak_force['Displacement_Input']
+    peak_force['Energy_Returned'] = peak_force['Energy_Returned_Raw'] - peak_force['Zero_Offset'] * peak_force['Displacement_Returned']
+    peak_force['Energy_Lost'] = peak_force['Energy_Input'] - peak_force['Energy_Returned']
+    peak_force['Energy_Return_Percent'] = 100 * peak_force['Energy_Returned'] / peak_force['Energy_Input']
+
+    # Hold relaxation (% of corrected peak force lost during the hold)
+    peak_force['Hold_Relaxation_Percent'] = 100 * (peak_force['Force'] - peak_force['Hold_End_Force']) / peak_force['Force_Corrected']
+
+    # Relative stiffness between high and low ranges
+    peak_force['Relative_Angular_Stiffness'] = peak_force['High_Angular_Stiffness'] / peak_force['Low_Angular_Stiffness']
+
+    # Warn if any stiffness windows could not be calculated
+    for label in ['Low', 'High']:
+        n_missing = peak_force[f'{label}_Angular_Stiffness'].isna().sum()
+        if n_missing > 0:
+            warnings.warn(f'{filelabel}: {label.lower()} angular stiffness could not be calculated in '
+                          f'{n_missing} of {len(peak_force)} cycles; these are set to NaN')
+
+    # Normalise to the baseline (mean of first cycles after seating)
+    # The primary outcome is normalised peak true force (corrected for zero offset)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', category=RuntimeWarning)  # mean of all-NaN baseline
+        for var in ['Force', 'True_Force', 'Moment', 'Force_Corrected', 'True_Force_Corrected', 'Moment_Corrected',
+                    'Force_Range', 'Low_Angular_Stiffness', 'High_Angular_Stiffness', 'Energy_Input',
+                    'Energy_Returned', 'Energy_Lost']:
+            baseline = np.nanmean(peak_force[var].iloc[:n_baseline_cycles])
+            peak_force[f'Normalised_{var}'] = peak_force[var] / baseline
+
+    # Report proportion of cycles where the shoe was already loaded at the start of the cycle
+    n_loaded_at_start = int(peak_force['Loaded_At_Cycle_Start'].sum())
+    if n_loaded_at_start > 0:
+        print(f'  Loaded at cycle start (load onset below tested range) in {n_loaded_at_start} '
+              f'of {len(peak_force)} cycles')
+
+    # Visualise normalised peak force change (raw, corrected and drift-free)
+    # -------------------------------------------------------------------------
     fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(15, 8))
-    ax.plot(peak_force['Cycle_ID'], peak_force['Normalised_Force'], 'b-',
-            label='Normalised Peak Force (Measured)', lw = 1.5)
-    if has_angle:
-        ax.plot(peak_force['Cycle_ID'], peak_force['Normalised_True_Force'], color='orange', ls='--',
-                label='Normalised Peak Force (True)', lw = 1.5)
+    ax.plot(peak_force['Cycle_ID'], peak_force['Normalised_True_Force'], color='grey', lw=1.0,
+            label='Normalised Peak True Force (Raw)')
+    ax.plot(peak_force['Cycle_ID'], peak_force['Normalised_True_Force_Corrected'], color='blue', lw=1.5,
+            label='Normalised Peak True Force (Zero Offset Corrected)'
+            if zero_offset_estimated else 'Normalised Peak True Force (No Correction Possible)')
+    ax.plot(peak_force['Cycle_ID'], peak_force['Normalised_Force_Range'], color='orange', lw=1.0, ls='--',
+            label='Normalised Force Range (Peak - Cycle Minimum; Drift-Free)')
     ax.axhline(y=1.0, color='dimgrey', linestyle='--', lw=1.5)
     ax.legend(loc='lower left')
     # Set limits and labels
     ax.set_xlim(0, test_data['Cycle_ID'].max())
     ax.set_xlabel('Cycle ID', fontsize=12, fontweight='bold', labelpad=10)
-    ax.set_ylim(0.60, 1.10)
-    ax.set_ylabel('Normalised Peak Force', fontsize=12, fontweight='bold', labelpad=10)
-    ax.set_title(f'{filelabel} Normalised Peak Force Drop', fontsize=12, fontweight='bold', pad=20)
+    ax.set_ylim(0.50, 1.20)
+    ax.set_ylabel('Normalised Value', fontsize=12, fontweight='bold', labelpad=10)
+    ax.set_title(f'{filelabel} Normalised Peak Force', fontsize=12, fontweight='bold', pad=20)
     # Save to processed folder
     fig.savefig(os.path.join(check_dir, f'{filelabel}_normalised-peak-force.png'),
                 format='png', dpi=150)
     # Close figure
     plt.close('all')
 
-    # Calculate stiffness across cycles
-    # This uses a similar principle to Yoshida et al. (2026), which looks at the change
-    # in force between 7.0 and 7.5 mm of displacement during the bending phase
-    # divided by the magnitude of displacement (i.e. 0.5 mm) to get N/mm
-    # See here for Yoshida et al. paper: https://doi.org/10.1177/1089313X251411487
-    # Here the displacement windows are changed to examine different regions of
-    # stiffness across the displacement tested (low: 4-7 mm; high: 10-13 mm; see
-    # settings above), and stiffness is taken as the slope of a linear fit to all
-    # samples within each window.
-    # If a test does not span a window (e.g. tests with a 10 mm peak displacement
-    # never reach the high window) stiffness is returned as NaN.
-    #
-    # Angular stiffness is also calculated following Oleson et al. (2005) as the
-    # slope of moment against bend angle (Nm/deg) within bend angle windows (see
-    # settings above). As bend angle is measured from each shoe's starting shape,
-    # this accounts for differences in lever arm and starting bend between shoes,
-    # and is the measure to use when comparing stiffness across shoes.
-    # -------------------------------------------------------------------------
-
-    # Set the stiffness measures to calculate
-    # (label, x variable, y variable, window start, window end, units)
-    stiffness_measures = [
-        ('Low', 'Displacement', 'Force', low_stiffness_start, low_stiffness_end, 'mm'),
-        ('High', 'Displacement', 'Force', high_stiffness_start, high_stiffness_end, 'mm'),
-        ('Low_Angular', 'Bend_Angle', 'Moment', low_bend_start, low_bend_end, 'deg'),
-        ('High_Angular', 'Bend_Angle', 'Moment', high_bend_start, high_bend_end, 'deg'),
-    ]
-
-    # Create dictionary to store calculated stiffness values
-    stiffness = {measure[0]: [] for measure in stiffness_measures}
-
-    # Loop through cycles to calculate stiffness during bending
-    bending_data = test_data[test_data['Phase'] == 1]
-    for cycle, cycle_data in bending_data.groupby('Cycle_ID'):
-        for label, x_var, y_var, start, end, _ in stiffness_measures:
-            stiffness[label].append(calculate_window_stiffness(cycle_data[x_var].to_numpy(),
-                                                               cycle_data[y_var].to_numpy(),
-                                                               start, end))
-
-    # Store stiffness values, warn about any windows that could not be calculated,
-    # and normalise each cycles stiffness to the baseline (mean of first cycles after seating)
-    for label, x_var, y_var, start, end, units in stiffness_measures:
-        values = np.asarray(stiffness[label])
-        peak_force[f'{label}_Stiffness'] = values
-        n_missing = np.isnan(values).sum()
-        if n_missing > 0 and (units == 'mm' or has_angle):
-            warnings.warn(f'{filelabel}: {label.lower().replace("_", " ")} stiffness window '
-                          f'({start}-{end} {units}) not spanned in {n_missing} of {len(values)} cycles; '
-                          f'these are set to NaN')
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', category=RuntimeWarning)  # mean of all-NaN baseline
-            baseline = np.nanmean(values[:n_baseline_cycles])
-        peak_force[f'{label}_Normalised_Stiffness'] = values / baseline
-
-    # Calculate relative stiffness between high and low ranges
-    peak_force['Relative_Stiffness'] = peak_force['High_Stiffness'] / peak_force['Low_Stiffness']
-    peak_force['Relative_Angular_Stiffness'] = peak_force['High_Angular_Stiffness'] / peak_force['Low_Angular_Stiffness']
-
-    # Calculate load onset across cycles
-    # This identifies where the shoe starts carrying load in each cycle (see load
-    # onset settings above). As the bend angle is measured from the shoe's original
-    # starting shape, increases in load onset angle across cycles indicate the shoe
-    # is not returning to its starting shape (i.e. retained bend).
-    # -------------------------------------------------------------------------
-
-    # Create lists to store load onset values
-    onset_displacement = []
-    onset_angle = []
-    onset_min_force = []
-    onset_loaded_at_start = []
-
-    # Loop through cycles to identify load onset during bending
-    for cycle, cycle_data in bending_data.groupby('Cycle_ID'):
-        displacement = cycle_data['Displacement'].to_numpy()
-        onset_ind, min_force, loaded_at_start = calculate_load_onset(displacement,
-                                                                     cycle_data['Force'].to_numpy())
-        onset_min_force.append(min_force)
-        onset_loaded_at_start.append(loaded_at_start)
-        if onset_ind is None:
-            onset_displacement.append(np.nan)
-            onset_angle.append(np.nan)
-        else:
-            sample_inds = np.arange(len(displacement))
-            onset_displacement.append(np.interp(onset_ind, sample_inds, displacement))
-            onset_angle.append(np.interp(onset_ind, sample_inds, cycle_data['Bend_Angle'].to_numpy()))
-
-    # Store load onset values
-    peak_force['Load_Onset_Displacement'] = onset_displacement
-    peak_force['Load_Onset_Bend_Angle'] = onset_angle
-    peak_force['Unloaded_Force'] = onset_min_force
-    peak_force['Loaded_At_Cycle_Start'] = onset_loaded_at_start
-
-    # Report proportion of cycles where the shoe was already loaded at the start of the cycle
-    n_loaded_at_start = int(np.sum(onset_loaded_at_start))
-    if n_loaded_at_start > 0:
-        print(f'  Loaded at cycle start (load onset below tested range) in {n_loaded_at_start} '
-              f'of {len(onset_loaded_at_start)} cycles')
-
     # Visualise load onset change
     # Cycles where the shoe was already loaded at the start are shown in grey, as
     # the true onset is below the tested range for these
-    onset_var, onset_units = ('Load_Onset_Bend_Angle', 'Bend Angle from Starting Shape (deg)') if has_angle \
-        else ('Load_Onset_Displacement', 'Displacement (mm)')
-    loaded_mask = peak_force['Loaded_At_Cycle_Start'].to_numpy()
+    # -------------------------------------------------------------------------
+    loaded_mask = peak_force['Loaded_At_Cycle_Start'].to_numpy().astype(bool)
     fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(15, 8))
-    ax.scatter(peak_force.loc[~loaded_mask, 'Cycle_ID'], peak_force.loc[~loaded_mask, onset_var],
+    ax.scatter(peak_force.loc[~loaded_mask, 'Cycle_ID'], peak_force.loc[~loaded_mask, 'Load_Onset_Bend_Angle'],
                s=4, color='purple', label='Load Onset')
-    ax.scatter(peak_force.loc[loaded_mask, 'Cycle_ID'], peak_force.loc[loaded_mask, onset_var],
+    ax.scatter(peak_force.loc[loaded_mask, 'Cycle_ID'], peak_force.loc[loaded_mask, 'Load_Onset_Bend_Angle'],
                s=4, color='grey', label='Loaded at Cycle Start (onset below tested range)')
     # Set limits and labels
     ax.set_xlim(0, test_data['Cycle_ID'].max())
     ax.set_ylim(bottom=0)
     ax.set_xlabel('Cycle ID', fontsize=12, fontweight='bold', labelpad=10)
-    ax.set_ylabel(f'Load Onset {onset_units}', fontsize=12, fontweight='bold', labelpad=10)
-    ax.set_title(f'{filelabel} Load Onset', fontsize=12, fontweight='bold', pad=20)
+    ax.set_ylabel('Load Onset Bend Angle from Starting Shape (deg)', fontsize=12, fontweight='bold', labelpad=10)
+    ax.set_title(f'{filelabel} Load Onset{" (offset assumed 0)" if offset_assumed else ""}',
+                 fontsize=12, fontweight='bold', pad=20)
     ax.legend(loc='lower right', markerscale=4)
     # Save to processed folder
     fig.savefig(os.path.join(check_dir, f'{filelabel}_load-onset.png'),
@@ -595,30 +660,43 @@ def analyse_degradation_test(shoe_info):
     plt.close('all')
 
     # Visualise normalised stiffness change
-    # Top panel: displacement windows (N/mm); bottom panel: bend angle windows (Nm/deg)
-    fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(15, 12), sharex=True)
-    for ax, (low_label, high_label), units in zip(axes, [('Low', 'High'), ('Low_Angular', 'High_Angular')],
-                                                  ['mm', 'deg']):
-        low_measure = [m for m in stiffness_measures if m[0] == low_label][0]
-        high_measure = [m for m in stiffness_measures if m[0] == high_label][0]
-        ax.plot(peak_force['Cycle_ID'], peak_force[f'{low_label}_Normalised_Stiffness'], 'g-',
-                label=f'Low Range: {low_measure[3]}-{low_measure[4]} {units}')
-        ax.plot(peak_force['Cycle_ID'], peak_force[f'{high_label}_Normalised_Stiffness'], 'r-',
-                label=f'High Range: {high_measure[3]}-{high_measure[4]} {units}')
-        ax.axhline(y=1.0, color='dimgrey', linestyle='--', lw=1.5)
-        ax.set_ylim(0.0, 1.20)
-        ax.legend(loc='lower right')
-    if not has_angle:
-        axes[1].text(0.5, 0.5, 'Applicator offset not recorded', transform=axes[1].transAxes,
-                     ha='center', va='center', fontsize=12)
+    # -------------------------------------------------------------------------
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(15, 8))
+    ax.plot(peak_force['Cycle_ID'], peak_force['Normalised_Low_Angular_Stiffness'], 'g-',
+            label=f'Low Range (first {stiffness_window_width:g} deg after load onset)')
+    ax.plot(peak_force['Cycle_ID'], peak_force['Normalised_High_Angular_Stiffness'], 'r-',
+            label=f'High Range (last {stiffness_window_width:g} deg before peak bend)')
+    ax.axhline(y=1.0, color='dimgrey', linestyle='--', lw=1.5)
     # Set limits and labels
-    axes[1].set_xlim(0, test_data['Cycle_ID'].max())
-    axes[1].set_xlabel('Cycle ID', fontsize=12, fontweight='bold', labelpad=10)
-    axes[0].set_ylabel('Normalised Stiffness\n(Force vs. Displacement)', fontsize=12, fontweight='bold', labelpad=10)
-    axes[1].set_ylabel('Normalised Stiffness\n(Moment vs. Bend Angle)', fontsize=12, fontweight='bold', labelpad=10)
-    axes[0].set_title(f'{filelabel} Normalised Stiffness Drop', fontsize=12, fontweight='bold', pad=20)
+    ax.set_xlim(0, test_data['Cycle_ID'].max())
+    ax.set_ylim(0.0, 1.50)
+    ax.set_xlabel('Cycle ID', fontsize=12, fontweight='bold', labelpad=10)
+    ax.set_ylabel('Normalised Angular Stiffness', fontsize=12, fontweight='bold', labelpad=10)
+    ax.set_title(f'{filelabel} Normalised Angular Stiffness', fontsize=12, fontweight='bold', pad=20)
+    ax.legend(loc='lower right')
     # Save to processed folder
     fig.savefig(os.path.join(check_dir, f'{filelabel}_normalised-stiffness.png'),
+                format='png', dpi=150)
+    # Close figure
+    plt.close('all')
+
+    # Visualise energy return and loss
+    # -------------------------------------------------------------------------
+    fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(15, 10), sharex=True)
+    axes[0].plot(peak_force['Cycle_ID'], peak_force['Energy_Input'], color='blue', label='Energy Input (Bending)')
+    axes[0].plot(peak_force['Cycle_ID'], peak_force['Energy_Returned'], color='green', label='Energy Returned (Relaxation)')
+    axes[0].plot(peak_force['Cycle_ID'], peak_force['Energy_Lost'], color='red', label='Energy Lost (Hysteresis)')
+    axes[0].set_ylim(bottom=0)
+    axes[0].set_ylabel('Energy (mJ)', fontsize=12, fontweight='bold', labelpad=10)
+    axes[0].legend(loc='upper right')
+    axes[1].plot(peak_force['Cycle_ID'], peak_force['Energy_Return_Percent'], color='black')
+    axes[1].set_ylim(0, 100)
+    axes[1].set_ylabel('Energy Returned (% of Input)', fontsize=12, fontweight='bold', labelpad=10)
+    axes[1].set_xlim(0, test_data['Cycle_ID'].max())
+    axes[1].set_xlabel('Cycle ID', fontsize=12, fontweight='bold', labelpad=10)
+    axes[0].set_title(f'{filelabel} Energy Return and Loss', fontsize=12, fontweight='bold', pad=20)
+    # Save to processed folder
+    fig.savefig(os.path.join(check_dir, f'{filelabel}_energy.png'),
                 format='png', dpi=150)
     # Close figure
     plt.close('all')
@@ -633,6 +711,7 @@ def analyse_degradation_test(shoe_info):
     # peak displacement as force relaxes
 
     # Identify cycles to plot
+    baseline_peak_force = peak_force['Force'].iloc[:n_baseline_cycles].mean()
     first_cycle = test_data['Cycle_ID'].min()
     last_cycle = test_data['Cycle_ID'].max()
     plot_cycles = list(range(first_cycle, last_cycle + 1, hysteresis_cycle_step))
@@ -668,43 +747,49 @@ def analyse_degradation_test(shoe_info):
     plt.close('all')
 
     # Visualise moment vs. bend angle loop
-    # Uses the same cycles as above, with the bend angle stiffness windows shaded
-    # to check that the windows sit on usable parts of the curve
-    if has_angle:
-        fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(15, 8))
-        ax.axvspan(low_bend_start, low_bend_end, color='green', alpha=0.1, label='Low Stiffness Window')
-        ax.axvspan(high_bend_start, high_bend_end, color='red', alpha=0.1, label='High Stiffness Window')
-        for cycle in plot_cycles:
-            cycle_data = test_data.loc[test_data['Cycle_ID'] == cycle,]
-            if cycle == first_cycle:
-                ax.plot(cycle_data['Bend_Angle'], cycle_data['Moment'],
-                        color='red', lw=2.0, ls='-', alpha=1.0, zorder=3, label=f'Cycle {cycle}')
-            else:
-                plot_alpha = 0.9 * (cycle - first_cycle) / max(last_cycle - first_cycle, 1)
-                ax.plot(cycle_data['Bend_Angle'], cycle_data['Moment'],
-                        color='blue', lw=2.0, ls='-', alpha=plot_alpha, zorder=2)
-        # Set limits and labels
-        ax.set_xlim(0, test_data['Bend_Angle'].max() + 0.5)
-        ax.set_ylim(bottom=0.0)
-        ax.set_xlabel('Bend Angle from Starting Shape (deg)', fontsize=12, fontweight='bold', labelpad=10)
-        ax.set_ylabel('Moment (Nm)', fontsize=12, fontweight='bold', labelpad=10)
-        ax.set_title(f'{filelabel} Moment vs. Bend Angle (every {hysteresis_cycle_step} cycles; '
-                     f'starting angle {start_angle:.1f} deg)', fontsize=12, fontweight='bold', pad=20)
-        ax.legend(loc='upper left')
-        # Save to processed folder
-        fig.savefig(os.path.join(check_dir, f'{filelabel}_moment-bend-angle.png'),
-                    format='png', dpi=150)
-        # Close figure
-        plt.close('all')
-
-    # TODO: quantify area of hysteresis loop...normalised version?
-        # > This is the integral of the displacement phase, minus the integral of the relaxation phase
-        #   Gives the area of the hysteresis loop
+    # Uses the same cycles as above. The stiffness windows for the first and last
+    # cycles are highlighted on the loading curve to check where they sit
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(15, 8))
+    for cycle in plot_cycles:
+        cycle_data = test_data.loc[test_data['Cycle_ID'] == cycle,]
+        if cycle == first_cycle:
+            ax.plot(cycle_data['Bend_Angle'], cycle_data['Moment'],
+                    color='red', lw=2.0, ls='-', alpha=1.0, zorder=3, label=f'Cycle {cycle}')
+        else:
+            plot_alpha = 0.9 * (cycle - first_cycle) / max(last_cycle - first_cycle, 1)
+            ax.plot(cycle_data['Bend_Angle'], cycle_data['Moment'],
+                    color='blue', lw=2.0, ls='-', alpha=plot_alpha, zorder=2,
+                    label=f'Cycle {cycle}' if cycle == last_cycle else None)
+    for cycle in [first_cycle, last_cycle]:
+        cycle_data = test_data.loc[(test_data['Cycle_ID'] == cycle) & (test_data['Phase'] == 1),]
+        row = peak_force.loc[peak_force['Cycle_ID'] == cycle].iloc[0]
+        for label, colour in [('Low', 'green'), ('High', 'orange')]:
+            in_window = cycle_data['Bend_Angle'].between(row[f'{label}_Window_Start'], row[f'{label}_Window_End'])
+            ax.plot(cycle_data.loc[in_window, 'Bend_Angle'], cycle_data.loc[in_window, 'Moment'],
+                    color=colour, lw=5.0, alpha=0.6, zorder=4,
+                    label=f'{label} Stiffness Window' if cycle == first_cycle else None)
+    # Set limits and labels
+    ax.set_xlim(0, test_data['Bend_Angle'].max() + 0.5)
+    ax.set_ylim(bottom=0.0)
+    ax.set_xlabel('Bend Angle from Starting Shape (deg)', fontsize=12, fontweight='bold', labelpad=10)
+    ax.set_ylabel('Moment (Nm)', fontsize=12, fontweight='bold', labelpad=10)
+    ax.set_title(f'{filelabel} Moment vs. Bend Angle (every {hysteresis_cycle_step} cycles; '
+                 f'starting angle {start_angle:.1f} deg{"; offset assumed 0" if offset_assumed else ""})',
+                 fontsize=12, fontweight='bold', pad=20)
+    ax.legend(loc='upper left')
+    # Save to processed folder
+    fig.savefig(os.path.join(check_dir, f'{filelabel}_moment-bend-angle.png'),
+                format='png', dpi=150)
+    # Close figure
+    plt.close('all')
 
     # Save processed data
     # -------------------------------------------------------------------------
     setup = {'lever_arm_mm': lever_arm,
-             'starting_angle_deg': start_angle if has_angle else None,
+             'applicator_offset_mm_used': applicator_offset,
+             'applicator_offset_assumed': offset_assumed,
+             'starting_angle_deg': start_angle,
+             'zero_offset_estimated': zero_offset_estimated,
              'n_cycles_recorded': int(incomplete_cycle_id)}
     save_processed_data(os.path.join(check_dir, f'{filelabel}_processed.json.gz'),
                         shoe_info, setup, test_data, peak_force)
@@ -730,9 +815,16 @@ processed_sample_variables = {
 # Units of cycle-level results (normalised values and ratios are unitless)
 processed_cycle_units = {
     'Force': 'N', 'True_Force': 'N', 'Moment': 'Nm',
-    'Low_Stiffness': 'N/mm', 'High_Stiffness': 'N/mm',
+    'Force_Corrected': 'N', 'True_Force_Corrected': 'N', 'Moment_Corrected': 'Nm',
+    'Zero_Offset': 'N', 'Force_Range': 'N', 'Unloaded_Force': 'N', 'Hold_End_Force': 'N',
+    'Peak_Force_Angle': 'deg', 'Peak_Bend_Angle': 'deg',
+    'Load_Onset_Displacement': 'mm', 'Load_Onset_Bend_Angle': 'deg',
     'Low_Angular_Stiffness': 'Nm/deg', 'High_Angular_Stiffness': 'Nm/deg',
-    'Load_Onset_Displacement': 'mm', 'Load_Onset_Bend_Angle': 'deg', 'Unloaded_Force': 'N',
+    'Low_Window_Start': 'deg', 'Low_Window_End': 'deg', 'High_Window_Start': 'deg', 'High_Window_End': 'deg',
+    'Energy_Input': 'mJ', 'Energy_Returned': 'mJ', 'Energy_Lost': 'mJ',
+    'Energy_Input_Raw': 'mJ', 'Energy_Returned_Raw': 'mJ',
+    'Displacement_Input': 'mm', 'Displacement_Returned': 'mm',
+    'Energy_Return_Percent': '%', 'Hold_Relaxation_Percent': '%',
 }
 
 def _to_json_value(value):
@@ -797,12 +889,12 @@ def save_processed_data(filepath, shoe_info, setup, test_data, peak_force):
             'hold_tolerance_mm': hold_tolerance,
             'n_seating_cycles': n_seating_cycles,
             'n_baseline_cycles': n_baseline_cycles,
-            'displacement_windows_mm': {'low': [low_stiffness_start, low_stiffness_end],
-                                        'high': [high_stiffness_start, high_stiffness_end]},
-            'bend_angle_windows_deg': {'low': [low_bend_start, low_bend_end],
-                                       'high': [high_bend_start, high_bend_end]},
+            'stiffness_window_width_deg': stiffness_window_width,
+            'stiffness_windows': 'low = first window width after load onset; high = last window width before peak bend',
             'load_onset_threshold_N': load_onset_threshold,
             'loaded_at_start_tolerance_mm': loaded_at_start_tolerance,
+            'zero_offset_window_cycles': zero_offset_window,
+            'zero_offset_min_cycles': zero_offset_min_cycles,
         },
         'units': {
             'data': {var: units for var, (units, _) in processed_sample_variables.items()} |
@@ -878,8 +970,8 @@ if __name__ == '__main__':
         print(f'Analysing {filename}...')
         test_data, peak_force = analyse_degradation_test(shoe_info)
         results[shoe_info['id']] = {'data': test_data, 'peak_force': peak_force}
-        print(f'  {len(peak_force)} cycles analysed; final normalised peak force = '
-              f'{peak_force["Normalised_Force"].iloc[-1]:.3f}')
+        print(f"  {len(peak_force)} cycles analysed; final normalised peak true force (corrected) = "
+              f"{peak_force['Normalised_True_Force_Corrected'].iloc[-1]:.3f}")
 
     # Summary check of moment vs. bend angle across shoes
     # -------------------------------------------------------------------------
@@ -889,8 +981,6 @@ if __name__ == '__main__':
     # windows shaded. Used to check the windows are covered by all shoes and sit
     # on usable parts of the curves.
     fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(15, 8))
-    ax.axvspan(low_bend_start, low_bend_end, color='green', alpha=0.1)
-    ax.axvspan(high_bend_start, high_bend_end, color='red', alpha=0.1)
     colours = plt.get_cmap('tab20')
     for ind, (filelabel, result) in enumerate(results.items()):
         test_data = result['data']
