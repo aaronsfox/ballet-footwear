@@ -482,11 +482,13 @@ if __name__ == '__main__':
     axes[0].legend(loc='upper center', bbox_to_anchor=(1.1, -0.22), ncol=4)
     save_figure(fig, os.path.join(aim1_dir, 'aim1_energy'))
 
-    # Hysteresis loops: moment vs. bend angle at first and last common cycle for
-    # each shoe, with stiffness windows highlighted (solid = cycle 21; dashed =
-    # cycle 2499; grey bands = stiffness windows). No legends or markers; curves are
-    # described in the caption. Shoes are titled by model and number, and the
-    # y-axis is shared within each row (model)
+    # Hysteresis loops: force vs. displacement at first and last common cycle for
+    # each shoe (solid = cycle 21; dashed = cycle 2499; grey bands = samples in the
+    # low/high stiffness windows). Force is corrected for load cell zero offset, and
+    # the loop area is the energy lost used in the energy outcomes. Energy loss (% of
+    # energy input) is reported top left for each cycle, next to a sample of its line
+    # style. Shoes are titled by model and number, and the y-axis is shared within
+    # each row (model)
     for groups, aim, filename in [(aim1_groups, 'aim1', 'aim1_hysteresis-loops'),
                                   (aim2_groups, 'aim2', 'aim2_hysteresis-loops')]:
         n_cols = max(len(shoes) for shoes in groups.values())
@@ -500,23 +502,30 @@ if __name__ == '__main__':
                     continue
                 shoe = shoes[col]
                 cycle_results = results[shoe].set_index('Cycle_ID')
+                energy_handles, energy_labels = [], []
                 for cycle, line_style in [(checkpoints['Start'][0], '-'), (last_common_cycle, '--')]:
                     data = samples[shoe][cycle].copy()
                     row_results = cycle_results.loc[cycle]
-                    # Correct moment for load cell zero offset
-                    data['Moment'] = data['Moment'] - row_results['Zero_Offset'] * info[shoe]['setup']['lever_arm_mm'] / 1000
+                    # Correct force for load cell zero offset
+                    data['Force'] = data['Force'] - row_results['Zero_Offset']
                     bending = data.loc[data['Phase'] == 1]
                     for window in ['Low', 'High']:
                         in_window = bending['Bend_Angle'].between(row_results[f'{window}_Window_Start'],
                                                                   row_results[f'{window}_Window_End'])
-                        ax.plot(bending.loc[in_window, 'Bend_Angle'], bending.loc[in_window, 'Moment'],
+                        ax.plot(bending.loc[in_window, 'Displacement'], bending.loc[in_window, 'Force'],
                                 color='#9a9a9a', lw=4, alpha=0.45, solid_capstyle='round', zorder=1)
-                    ax.plot(data['Bend_Angle'], data['Moment'], color=ps.colour(row), ls=line_style, lw=1.0, zorder=2)
+                    line, = ax.plot(data['Displacement'], data['Force'], color=ps.colour(row), ls=line_style,
+                                    lw=1.0, zorder=2)
+                    energy_handles.append(line)
+                    energy_labels.append(f'Energy Loss: {100 - row_results["Energy_Return_Percent"]:.0f}%')
+                ax.legend(energy_handles, energy_labels, loc='upper left', fontsize=6, handlelength=1.6,
+                          handletextpad=0.4, borderaxespad=0.2, labelspacing=0.2)
                 ax.set_title(f'{group} {col + 1}', fontsize=8)
-                ax.set_xlabel('Bend Angle (deg)')
+                ax.set_xlabel('Displacement (mm)')
+                ax.set_xticks([3, 6, 9, 12, 15])
+                ax.set_xlim(2, 16)
                 if col == 0:
-                    ax.set_ylabel('Moment (Nm)')
-                ax.set_xlim(left=0)
+                    ax.set_ylabel('Force (N)')
             axes[row, 0].set_ylim(bottom=min(0, axes[row, 0].get_ylim()[0]))
         fig.tight_layout()
         save_figure(fig, os.path.join(results_path, aim, filename))
