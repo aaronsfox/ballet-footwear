@@ -188,7 +188,8 @@ def save_figure(fig, filepath_no_ext):
     """Saves a figure as PNG and PDF (editable text) and closes it."""
 
     fig.savefig(f'{filepath_no_ext}.png', format='png')
-    fig.savefig(f'{filepath_no_ext}.pdf', format='pdf')
+    # No creation date in the PDF, so re-running unchanged figures gives identical files
+    fig.savefig(f'{filepath_no_ext}.pdf', format='pdf', metadata={'CreationDate': None})
     plt.close(fig)
 
 # Function to plot a curve with sparse markers
