@@ -33,8 +33,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 
-# Import processing script for paths, settings and plot settings
+# Import processing script for paths and settings, and shared figure style
 import degradation_analysis as da
+import plot_style as ps
 
 # =========================================================================
 # Set-up
@@ -59,8 +60,8 @@ aim2_groups = {
 aim3_new = ['bloch_5', 'bloch_6']
 aim3_used = 'bloch-u_1'
 
-# Group colours (fixed order; validated for colour vision deficiency separation)
-group_colours = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100']
+# Group colours and markers come from the shared style (plot_style.PALETTE and
+# plot_style.MARKERS), assigned in group order
 
 # Outcome extraction settings
 # -------------------------------------------------------------------------
@@ -109,10 +110,15 @@ absolute_measures = {
     'onset_displacement': ('Load_Onset_Displacement', 'Load Onset Displacement', 'mm'),
 }
 
-# Plot style tweaks (on top of degradation_analysis settings)
-plt.rcParams.update({'font.weight': 'normal', 'axes.labelweight': 'normal',
-                     'axes.titleweight': 'normal', 'axes.titlesize': 12})
-grid_colour = '#e6e6e2'
+# Apply shared figure style (overrides the processing script's check-figure settings)
+ps.apply_style()
+
+# Spacing (cycles) of markers on group mean curves; markers are staggered between
+# groups so they do not overlap
+marker_spacing = 250
+
+# Figure height (inches) for a single row of panels
+row_height = 2.6
 
 # =========================================================================
 # Define functions
@@ -175,32 +181,54 @@ def extract_checkpoints(series):
 
     return {label: series.loc[start:end].median() for label, (start, end) in checkpoints.items()}
 
+# Function to save figures
+# -------------------------------------------------------------------------
+def save_figure(fig, filepath_no_ext):
+
+    """Saves a figure as PNG and PDF (editable text) and closes it."""
+
+    fig.savefig(f'{filepath_no_ext}.png', format='png')
+    fig.savefig(f'{filepath_no_ext}.pdf', format='pdf')
+    plt.close(fig)
+
+# Function to plot a curve with sparse markers
+# -------------------------------------------------------------------------
+def plot_marked(ax, x, y, index, label=None, **kwargs):
+
+    """
+    Plots a line in the palette colour for this index, with the matching marker
+    shape every marker_spacing points (staggered by index so markers from
+    different series do not overlap).
+    """
+
+    offset = (index * marker_spacing // 4) % marker_spacing
+    ax.plot(x, y, color=ps.colour(index), marker=ps.marker(index), markersize=3.5,
+            markevery=(offset, marker_spacing), label=label, **kwargs)
+
 # Function to plot group curves
 # -------------------------------------------------------------------------
 def plot_group_curves(ax, groups, curves, ylabel, reference=None):
 
     """
-    Plots each shoe's smoothed curve (thin) and the group mean (thick) for each
-    group, with a legend naming the groups and their shoes.
+    Plots each shoe's smoothed curve (thin) and the group mean (thick, with
+    markers) for each group, labelled with the group name and number of shoes.
     """
 
-    for (group, shoes), colour in zip(groups.items(), group_colours):
+    for index, (group, shoes) in enumerate(groups.items()):
         group_curves = pd.concat({shoe: curves[shoe] for shoe in shoes if shoe in curves}, axis=1)
         if group_curves.dropna(how='all').empty:
             continue
         for shoe in group_curves.columns:
-            ax.plot(group_curves.index, group_curves[shoe], color=colour, lw=0.8, alpha=0.45)
+            ax.plot(group_curves.index, group_curves[shoe], color=ps.colour(index), lw=0.6, alpha=0.4)
         # Group mean only where every shoe in the group has a value (avoids jumps
         # as shoes enter/leave, e.g. when load onset becomes measurable)
-        ax.plot(group_curves.index, group_curves.mean(axis=1, skipna=False), color=colour, lw=2.5,
-                label=f'{group} (n={group_curves.shape[1]})')
+        plot_marked(ax, group_curves.index, group_curves.mean(axis=1, skipna=False), index,
+                    label=f'{group} (n={group_curves.shape[1]})')
     if reference is not None:
-        ax.axhline(reference, color='dimgrey', ls='--', lw=1.0)
+        ax.axhline(reference, color='dimgrey', ls='--', lw=0.8)
     ax.set_xlim(0, last_common_cycle + 1)
     ax.set_xlabel('Cycle')
     ax.set_ylabel(ylabel)
-    ax.grid(axis='y', color=grid_colour, lw=0.8)
-    ax.set_axisbelow(True)
 
 # Decay models for Aim 3
 # -------------------------------------------------------------------------
@@ -351,68 +379,60 @@ if __name__ == '__main__':
                                                index=False, float_format='%.4f')
 
     # Primary outcome: normalised peak true force
-    fig, ax = plt.subplots(figsize=(12, 6.5))
+    fig, ax = plt.subplots(figsize=(ps.SINGLE_COLUMN, row_height + 0.3))
     plot_group_curves(ax, aim1_groups, curves['peak_true_force'], 'Normalised peak true force', reference=1.0)
     ax.set_ylim(0.6, 1.15)
-    ax.legend(loc='lower left', frameon=False)
-    ax.set_title('Peak true force relative to cycles 21-30 (group mean thick, individual shoes thin; '
-                 f'{smoothing_window}-cycle running median)', loc='left')
-    fig.tight_layout()
-    fig.savefig(os.path.join(aim1_dir, 'aim1_normalised-peak-true-force.png'), format='png', dpi=200)
-    plt.close('all')
+    ax.legend(loc='lower left')
+    ax.set_title('Peak true force')
+    save_figure(fig, os.path.join(aim1_dir, 'aim1_normalised-peak-true-force'))
 
     # Stiffness: low and high range
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(ps.DOUBLE_COLUMN, row_height), sharey=True)
     for ax, outcome, title in zip(axes, ['low_stiffness', 'high_stiffness'],
-                                  [f'Low range: first {da.stiffness_window_width:g}° after load onset',
-                                   f'High range: last {da.stiffness_window_width:g}° before peak bend']):
+                                  [f'Low range (first {da.stiffness_window_width:g}° after load onset)',
+                                   f'High range (last {da.stiffness_window_width:g}° before peak bend)']):
         plot_group_curves(ax, aim1_groups, curves[outcome], 'Normalised angular stiffness', reference=1.0)
-        ax.set_title(title, loc='left')
+        ax.set_title(title)
+    axes[1].set_ylabel('')
     axes[0].set_ylim(0.6, 1.9)
-    axes[0].legend(loc='upper left', frameon=False)
-    fig.tight_layout()
-    fig.savefig(os.path.join(aim1_dir, 'aim1_normalised-stiffness.png'), format='png', dpi=200)
-    plt.close('all')
+    axes[0].legend(loc='upper left')
+    save_figure(fig, os.path.join(aim1_dir, 'aim1_normalised-stiffness'))
 
     # Deformation: retained bend (load onset angle)
     # Shoes that carry load at the bottom of every cycle have no measurable onset;
     # their detection limit (bend angle at the bottom of the stroke) is shown dotted
-    fig, ax = plt.subplots(figsize=(12, 6.5))
-    plot_group_curves(ax, aim1_groups, curves['deformation'],
-                      'Load onset bend angle from original starting shape (deg)')
-    for (group, shoes), colour in zip(aim1_groups.items(), group_colours):
+    fig, ax = plt.subplots(figsize=(ps.SINGLE_COLUMN, row_height + 0.3))
+    plot_group_curves(ax, aim1_groups, curves['deformation'], 'Load onset angle (deg)')
+    cycles = np.arange(checkpoints['Start'][0], last_common_cycle + 1)
+    for index, (group, shoes) in enumerate(aim1_groups.items()):
         if all(results[shoe]['Loaded_At_Cycle_Start'].all() for shoe in shoes):
             limit = np.mean([results[shoe]['Load_Onset_Bend_Angle'].median() for shoe in shoes])
-            ax.axhline(limit, color=colour, ls=':', lw=2.0,
-                       label=f'{group}: below detection limit (< {limit:.1f}°) in all cycles')
+            plot_marked(ax, cycles, np.full(len(cycles), limit), index, ls=':', lw=1.2,
+                        label=f'{group}: < {limit:.1f}° (below limit)')
     ax.set_ylim(0, 9)
-    ax.legend(loc='lower right', frameon=False)
-    ax.set_title('Retained bend: angle at which the shoe starts carrying load in each cycle', loc='left')
-    fig.tight_layout()
-    fig.savefig(os.path.join(aim1_dir, 'aim1_deformation.png'), format='png', dpi=200)
-    plt.close('all')
+    ax.legend(loc='lower right', fontsize=7)
+    ax.set_title('Retained bend')
+    save_figure(fig, os.path.join(aim1_dir, 'aim1_deformation'))
 
     # Energy: returned (% of input) and normalised energy lost
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5))
-    plot_group_curves(axes[0], aim1_groups, curves['energy_return'], 'Energy returned (% of energy input)')
+    fig, axes = plt.subplots(1, 2, figsize=(ps.DOUBLE_COLUMN, row_height))
+    plot_group_curves(axes[0], aim1_groups, curves['energy_return'], 'Energy returned (% of input)')
     axes[0].set_ylim(30, 75)
-    axes[0].set_title('Energy returned during relaxation', loc='left')
-    plot_group_curves(axes[1], aim1_groups, curves['energy_lost'], 'Normalised energy lost (hysteresis area)',
-                      reference=1.0)
+    axes[0].set_title('Energy returned')
+    plot_group_curves(axes[1], aim1_groups, curves['energy_lost'], 'Normalised energy lost', reference=1.0)
     axes[1].set_ylim(0.5, 1.3)
-    axes[1].set_title('Energy lost per cycle relative to cycles 21-30', loc='left')
-    axes[0].legend(loc='lower left', frameon=False)
-    fig.tight_layout()
-    fig.savefig(os.path.join(aim1_dir, 'aim1_energy.png'), format='png', dpi=200)
-    plt.close('all')
+    axes[1].set_title('Energy lost (hysteresis)')
+    axes[0].legend(loc='upper center', bbox_to_anchor=(1.1, -0.22), ncol=4)
+    save_figure(fig, os.path.join(aim1_dir, 'aim1_energy'))
 
     # Hysteresis loops: moment vs. bend angle at first and last common cycle for
     # each shoe, with stiffness windows highlighted and energy return annotated
-    for groups, aim, filename in [(aim1_groups, 'aim1', 'aim1_hysteresis-loops.png'),
-                                  (aim2_groups, 'aim2', 'aim2_hysteresis-loops.png')]:
+    # (solid, filled markers = cycle 21; dashed, open markers = cycle 2499)
+    for groups, aim, filename in [(aim1_groups, 'aim1', 'aim1_hysteresis-loops'),
+                                  (aim2_groups, 'aim2', 'aim2_hysteresis-loops')]:
         n_cols = max(len(shoes) for shoes in groups.values())
-        fig, axes = plt.subplots(len(groups), n_cols, figsize=(5 * n_cols, 4 * len(groups)), squeeze=False)
-        for row, ((group, shoes), colour) in enumerate(zip(groups.items(), group_colours)):
+        fig, axes = plt.subplots(len(groups), n_cols, figsize=(ps.DOUBLE_COLUMN, 2.1 * len(groups)), squeeze=False)
+        for row, (group, shoes) in enumerate(groups.items()):
             for col in range(n_cols):
                 ax = axes[row, col]
                 if col >= len(shoes):
@@ -420,31 +440,30 @@ if __name__ == '__main__':
                     continue
                 shoe = shoes[col]
                 cycle_results = results[shoe].set_index('Cycle_ID')
-                for cycle, line_style, alpha in [(checkpoints['Start'][0], '-', 1.0), (last_common_cycle, '--', 0.9)]:
+                for cycle, line_style, face in [(checkpoints['Start'][0], '-', ps.colour(row)),
+                                                (last_common_cycle, '--', 'white')]:
                     data = samples[shoe][cycle].copy()
                     row_results = cycle_results.loc[cycle]
                     # Correct moment for load cell zero offset
                     data['Moment'] = data['Moment'] - row_results['Zero_Offset'] * info[shoe]['setup']['lever_arm_mm'] / 1000
-                    ax.plot(data['Bend_Angle'], data['Moment'], color=colour, ls=line_style, lw=1.5, alpha=alpha,
-                            label=f'Cycle {cycle}: {row_results["Energy_Return_Percent"]:.0f}% returned')
                     bending = data.loc[data['Phase'] == 1]
-                    for window, window_colour in [('Low', '#555555'), ('High', '#111111')]:
+                    for window in ['Low', 'High']:
                         in_window = bending['Bend_Angle'].between(row_results[f'{window}_Window_Start'],
                                                                   row_results[f'{window}_Window_End'])
                         ax.plot(bending.loc[in_window, 'Bend_Angle'], bending.loc[in_window, 'Moment'],
-                                color=window_colour, lw=4, alpha=0.35, solid_capstyle='round')
-                ax.set_title(f'{shoe} ({group})', loc='left', fontsize=10)
+                                color='#9a9a9a', lw=4, alpha=0.45, solid_capstyle='round', zorder=1)
+                    ax.plot(data['Bend_Angle'], data['Moment'], color=ps.colour(row), ls=line_style, lw=1.0,
+                            marker=ps.marker(row), markersize=2.5, markevery=40, markerfacecolor=face,
+                            markeredgewidth=0.6, zorder=2,
+                            label=f'Cycle {cycle}: {row_results["Energy_Return_Percent"]:.0f}% returned')
+                ax.set_title(f'{shoe} ({group})', fontsize=8)
                 ax.set_xlabel('Bend angle (deg)')
                 ax.set_ylabel('Moment (Nm)')
                 ax.set_xlim(left=0)
                 ax.set_ylim(bottom=min(0, ax.get_ylim()[0]))
-                ax.grid(axis='y', color=grid_colour, lw=0.8)
-                ax.legend(loc='upper left', frameon=False, fontsize=8)
-        fig.suptitle('Moment vs. bend angle loops, corrected for load cell zero offset (solid = cycle 21, '
-                     'dashed = cycle 2499; grey bands = low/high stiffness windows)', x=0.01, ha='left')
-        fig.tight_layout(rect=(0, 0, 1, 0.97))
-        fig.savefig(os.path.join(results_path, aim, filename), format='png', dpi=150)
-        plt.close('all')
+                ax.legend(loc='upper left', fontsize=6, handlelength=2.5)
+        fig.tight_layout()
+        save_figure(fig, os.path.join(results_path, aim, filename))
 
     # Aim 2: stronger shank vs. standard Heritage
     # -------------------------------------------------------------------------
@@ -454,19 +473,21 @@ if __name__ == '__main__':
                                                index=False, float_format='%.4f')
 
     # Normalised outcomes
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    for ax, outcome, ylim in zip(axes.flat, ['peak_true_force', 'low_stiffness', 'high_stiffness', 'energy_return'],
-                                 [(0.6, 1.15), (0.6, 1.5), (0.6, 1.5), (30, 75)]):
+    fig, axes = plt.subplots(2, 2, figsize=(ps.DOUBLE_COLUMN, 2 * row_height))
+    for ax, outcome, ylim, title in zip(axes.flat,
+                                        ['peak_true_force', 'low_stiffness', 'high_stiffness', 'energy_return'],
+                                        [(0.6, 1.15), (0.6, 1.5), (0.6, 1.5), (30, 75)],
+                                        ['Peak true force', 'Low-range stiffness', 'High-range stiffness',
+                                         'Energy returned']):
         column, label, units, normalised = outcomes[outcome]
-        plot_group_curves(ax, aim2_groups, curves[outcome], label + (f' ({units})' if units else ''),
+        plot_group_curves(ax, aim2_groups, curves[outcome],
+                          'Energy returned (% of input)' if outcome == 'energy_return' else 'Normalised value',
                           reference=1.0 if normalised else None)
         ax.set_ylim(*ylim)
-    axes[0, 0].legend(loc='lower left', frameon=False)
-    fig.suptitle('Strong vs. standard Heritage shank (strong shank applicator offset assumed 0 mm; '
-                 'normalised force unaffected)', x=0.01, ha='left')
+        ax.set_title(title)
+    axes[0, 0].legend(loc='lower left')
     fig.tight_layout()
-    fig.savefig(os.path.join(aim2_dir, 'aim2_normalised-outcomes.png'), format='png', dpi=200)
-    plt.close('all')
+    save_figure(fig, os.path.join(aim2_dir, 'aim2_normalised-outcomes'))
 
     # Absolute outcomes (same model, size and shank length, so directly comparable)
     # Load onset is shown as displacement (mm), which does not depend on the offset
@@ -476,18 +497,16 @@ if __name__ == '__main__':
                                                             mask_loaded_at_start=(measure == 'onset_displacement'),
                                                             last_cycle=last_common_cycle))
                                     for shoe in all_shoes}
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(ps.DOUBLE_COLUMN, 2 * row_height))
     for ax, measure in zip(axes.flat, ['moment', 'low_stiffness_abs', 'high_stiffness_abs', 'onset_displacement']):
         column, label, units = absolute_measures[measure]
         plot_group_curves(ax, aim2_groups, absolute_curves[measure], f'{label} ({units})')
         ax.set_ylim(bottom=0)
+        ax.set_title(label)
     axes[1, 1].set_ylim(0, 9)
-    axes[0, 0].legend(loc='lower left', frameon=False)
-    fig.suptitle('Strong vs. standard Heritage shank: absolute values (angle-based stiffness for strong shank '
-                 'uses assumed 0 mm offset)', x=0.01, ha='left')
+    axes[0, 0].legend(loc='lower left')
     fig.tight_layout()
-    fig.savefig(os.path.join(aim2_dir, 'aim2_absolute-outcomes.png'), format='png', dpi=200)
-    plt.close('all')
+    save_figure(fig, os.path.join(aim2_dir, 'aim2_absolute-outcomes'))
 
     # Aim 3: used vs. new European
     # -------------------------------------------------------------------------
@@ -536,105 +555,104 @@ if __name__ == '__main__':
     equivalence = pd.DataFrame(equivalence_rows)
     equivalence.to_csv(os.path.join(aim3_dir, 'aim3_equivalent_cycles.csv'), index=False, float_format='%.4f')
 
+    # Shoe order for colours/markers in Aim 3 figures (new shoes, then used shoe)
+    aim3_shoes = aim3_new + [aim3_used]
+
     # Visualise decay fits and the used shoe's starting value (log cycle axis to show extrapolation)
     extrapolate_to = 1e6
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     model_styles = {'Logarithmic': '--', 'Power': '-.', 'Exponential plateau': ':'}
+    fig, axes = plt.subplots(2, 3, figsize=(ps.DOUBLE_COLUMN, 2 * row_height))
     for ax, measure in zip(axes.flat, aim3_measures):
         column, label, units = absolute_measures[measure]
         used_value = equivalence.loc[equivalence['measure'] == measure, 'used_start_value'].iloc[0]
-        for shoe, colour in zip(aim3_new, group_colours[:2]):
-            series = get_series(results[shoe], column).dropna()
-            ax.plot(series.index, smooth(series), color=colour, lw=2, label=f'{shoe} (new)')
-            n_ext = np.logspace(np.log10(checkpoints['Start'][0]), np.log10(extrapolate_to), 300)
-            for name, (params, r_squared, aic) in fits_all[(measure, shoe)].items():
-                model = decay_models[name][0]
-                ax.plot(n_ext, model(n_ext, *params), color=colour, lw=1, ls=model_styles[name], alpha=0.8,
-                        label=f'{name} fit' if shoe == aim3_new[0] else None)
-        used_series = smooth(get_series(results[aim3_used], column).dropna())
-        ax.plot(used_series.index, used_series, color='#555555', lw=1.5, label=f'{aim3_used} (used) own test')
-        ax.axhline(used_value, color='black', lw=1.2, label=f'{aim3_used} start value')
-        ax.axvspan(checkpoints['Start'][0], max(results[s]['Cycle_ID'].max() for s in aim3_new),
-                   color='#d9d9d4', alpha=0.25, lw=0)
+        ax.axvspan(checkpoints['Start'][0], max(results[shoe]['Cycle_ID'].max() for shoe in aim3_new),
+                   color='#e8e8e4', lw=0, zorder=0)
+        n_ext = np.logspace(np.log10(checkpoints['Start'][0]), np.log10(extrapolate_to), 300)
+        for index, shoe in enumerate(aim3_shoes):
+            series = smooth(get_series(results[shoe], column).dropna()).dropna()
+            ax.plot(series.index, series, color=ps.colour(index), lw=1.4, marker=ps.marker(index), markersize=3,
+                    markevery=0.1, label=f'{shoe} ({"used" if shoe == aim3_used else "new"})')
+            if shoe in aim3_new:
+                for name, (params, r_squared, aic) in fits_all[(measure, shoe)].items():
+                    ax.plot(n_ext, decay_models[name][0](n_ext, *params), color=ps.colour(index), lw=0.7,
+                            ls=model_styles[name])
+        ax.axhline(used_value, color='black', lw=0.8, label=f'{aim3_used} start value')
         ax.set_xscale('log')
         ax.set_xlim(checkpoints['Start'][0], extrapolate_to)
-        ax.set_xlabel('Cycle (log scale; shaded = tested range)')
+        ax.set_xlabel('Cycle (log scale)')
         ax.set_ylabel(f'{label} ({units})')
-        ax.grid(axis='y', color=grid_colour, lw=0.8)
-    axes[0, 0].legend(loc='lower left', frameon=False, fontsize=8)
-    fig.suptitle('Used vs. new Bloch European: decay fits to new shoes and the used shoe\'s starting value',
-                 x=0.01, ha='left')
+        ax.set_title(label, fontsize=8)
+    # Legend: shoes (colour and marker), fit models (line style, shown in grey as each
+    # shoe's fits are drawn in its own colour) and the used shoe's start value
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    handles += [plt.Line2D([], [], color='grey', lw=0.7, ls=style) for style in model_styles.values()]
+    labels += [f'{name} fit' for name in model_styles]
+    fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=7, bbox_to_anchor=(0.5, -0.06))
     fig.tight_layout()
-    fig.savefig(os.path.join(aim3_dir, 'aim3_decay-fits.png'), format='png', dpi=150)
-    plt.close('all')
+    save_figure(fig, os.path.join(aim3_dir, 'aim3_decay-fits'))
 
     # Starting shape vs. deformation
     # The resting sole angle is the starting angle (from the applicator offset) plus
     # the load onset bend angle (retained bend) in each cycle. For the new shoes this
     # shows how the test moves the shoe's resting shape; the used shoe's starting
     # angle shows where wear has left it
-    fig, ax = plt.subplots(figsize=(12, 6.5))
-    for shoe, colour in zip(aim3_new + [aim3_used], group_colours[:2] + ['#555555']):
+    fig, ax = plt.subplots(figsize=(ps.SINGLE_COLUMN, row_height + 0.4))
+    for index, shoe in enumerate(aim3_shoes):
         start_angle = info[shoe]['setup']['starting_angle_deg']
         onset = smooth(get_series(results[shoe], 'Load_Onset_Bend_Angle', mask_loaded_at_start=True))
-        ax.plot(onset.index, start_angle + onset, color=colour, lw=2,
-                label=f'{shoe} resting angle during test (starting angle {start_angle:.1f}°)')
-        ax.axhline(start_angle, color=colour, ls=':', lw=1.5)
+        plot_marked(ax, onset.index, start_angle + onset, index,
+                    label=f'{shoe} ({"used" if shoe == aim3_used else "new"}; start {start_angle:.1f}°)')
+        ax.axhline(start_angle, color=ps.colour(index), ls=':', lw=1.0)
     ax.set_xlim(left=0)
     ax.set_ylim(0, 25)
     ax.set_xlabel('Cycle')
-    ax.set_ylabel('Sole angle at load onset (deg from horizontal)')
-    ax.grid(axis='y', color=grid_colour, lw=0.8)
-    ax.legend(loc='center right', frameon=False)
-    ax.set_title('Resting sole angle: starting angle (dotted) plus retained bend during testing (solid)', loc='left')
-    fig.tight_layout()
-    fig.savefig(os.path.join(aim3_dir, 'aim3_starting-angle-vs-deformation.png'), format='png', dpi=200)
-    plt.close('all')
+    ax.set_ylabel('Sole angle at load onset (deg)')
+    ax.legend(loc='lower right', fontsize=7)
+    ax.set_title('Resting angle vs. starting angle (dotted)')
+    save_figure(fig, os.path.join(aim3_dir, 'aim3_starting-angle-vs-deformation'))
 
     # Normalised profiles (rate of degradation) for used vs. new
     aim3_groups = {'Bloch European (new)': aim3_new, 'Bloch European (used)': [aim3_used]}
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    for ax, outcome, ylim in zip(axes, ['peak_true_force', 'low_stiffness', 'high_stiffness'],
-                                 [(0.6, 1.15), (0.6, 1.5), (0.6, 1.5)]):
-        plot_group_curves(ax, aim3_groups, curves[outcome], outcomes[outcome][1], reference=1.0)
+    fig, axes = plt.subplots(1, 3, figsize=(ps.DOUBLE_COLUMN, row_height))
+    for ax, outcome, ylim, title in zip(axes, ['peak_true_force', 'low_stiffness', 'high_stiffness'],
+                                        [(0.6, 1.15), (0.6, 1.5), (0.6, 1.5)],
+                                        ['Peak true force', 'Low-range stiffness', 'High-range stiffness']):
+        plot_group_curves(ax, aim3_groups, curves[outcome], 'Normalised value', reference=1.0)
         ax.set_ylim(*ylim)
-    axes[0].legend(loc='lower left', frameon=False)
-    fig.suptitle('Used vs. new Bloch European: normalised profiles', x=0.01, ha='left')
+        ax.set_title(title)
+    axes[0].legend(loc='lower left', fontsize=7)
     fig.tight_layout()
-    fig.savefig(os.path.join(aim3_dir, 'aim3_normalised-profiles.png'), format='png', dpi=200)
-    plt.close('all')
+    save_figure(fig, os.path.join(aim3_dir, 'aim3_normalised-profiles'))
     group_checkpoint_table(aim3_groups).to_csv(os.path.join(aim3_dir, 'aim3_group_checkpoints.csv'),
                                                index=False, float_format='%.4f')
 
     # Checks: load cell zero offset and drift-free force range
     # -------------------------------------------------------------------------
     print('Checks...')
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6.5))
-    for shoe in all_shoes:
+    fig, axes = plt.subplots(1, 2, figsize=(ps.DOUBLE_COLUMN, row_height + 0.4))
+    offset_shoes = [shoe for shoe in all_shoes
+                    if results[shoe]['Zero_Offset_Estimated'].iloc[0] in (True, 'True', 1)]
+    for index, shoe in enumerate(offset_shoes):
         offset = get_series(results[shoe], 'Zero_Offset')
-        if results[shoe]['Zero_Offset_Estimated'].iloc[0] in (True, 'True', 1):
-            axes[0].plot(offset.index, offset, lw=1.2, label=shoe)
+        plot_marked(axes[0], offset.index, offset, index, lw=1.0, label=shoe)
     axes[0].set_xlabel('Cycle')
-    axes[0].set_ylabel('Estimated load cell zero offset (N)')
-    axes[0].set_title('Zero offset from unloaded readings (shoes that unload only)', loc='left')
-    axes[0].legend(loc='upper left', frameon=False, fontsize=8, ncol=2)
-    axes[0].grid(axis='y', color=grid_colour, lw=0.8)
-    for (group, shoes), colour in zip(aim1_groups.items(), group_colours):
+    axes[0].set_ylabel('Estimated zero offset (N)')
+    axes[0].set_title('Load cell zero offset')
+    axes[0].legend(loc='upper center', bbox_to_anchor=(0.5, -0.22), fontsize=7, ncol=4)
+    for index, (group, shoes) in enumerate(aim1_groups.items()):
         for shoe in shoes:
-            axes[1].plot(curves['peak_true_force'][shoe].index, curves['peak_true_force'][shoe], color=colour, lw=1.5,
-                         label=f'{group}' if shoe == shoes[0] else None)
-            axes[1].plot(curves['force_range'][shoe].index, curves['force_range'][shoe], color=colour, lw=1.0,
-                         ls='--')
-    axes[1].axhline(1.0, color='dimgrey', ls='--', lw=1.0)
+            plot_marked(axes[1], curves['peak_true_force'][shoe].index, curves['peak_true_force'][shoe], index,
+                        lw=1.0, label=group if shoe == shoes[0] else None)
+            axes[1].plot(curves['force_range'][shoe].index, curves['force_range'][shoe], color=ps.colour(index),
+                         lw=0.7, ls='--')
+    axes[1].axhline(1.0, color='dimgrey', ls='--', lw=0.8)
     axes[1].set_xlim(0, last_common_cycle + 1)
     axes[1].set_xlabel('Cycle')
     axes[1].set_ylabel('Normalised value')
-    axes[1].set_title('Peak true force (solid) vs. drift-free force range (dashed)', loc='left')
-    axes[1].legend(loc='lower left', frameon=False)
-    axes[1].grid(axis='y', color=grid_colour, lw=0.8)
+    axes[1].set_title('Peak true force (solid) vs. force range (dashed)')
+    axes[1].legend(loc='upper center', bbox_to_anchor=(0.5, -0.22), fontsize=7, ncol=2)
     fig.tight_layout()
-    fig.savefig(os.path.join(results_path, 'checks', 'drift-check.png'), format='png', dpi=150)
-    plt.close('all')
+    save_figure(fig, os.path.join(results_path, 'checks', 'drift-check'))
 
     print('Done.')
 
