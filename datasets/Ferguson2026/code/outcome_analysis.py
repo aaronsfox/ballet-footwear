@@ -207,23 +207,28 @@ def plot_marked(ax, x, y, index, label=None, **kwargs):
 
 # Function to plot group curves
 # -------------------------------------------------------------------------
-def plot_group_curves(ax, groups, curves, ylabel, reference=None):
+def plot_group_curves(ax, groups, curves, ylabel, reference=None, markers=True, scale=1.0):
 
     """
     Plots each shoe's smoothed curve (thin) and the group mean (thick, with
-    markers) for each group, labelled with the group name and number of shoes.
+    markers unless markers=False) for each group, labelled with the group name
+    and number of shoes. Values are multiplied by scale (e.g. 100 for %).
     """
 
     for index, (group, shoes) in enumerate(groups.items()):
-        group_curves = pd.concat({shoe: curves[shoe] for shoe in shoes if shoe in curves}, axis=1)
+        group_curves = pd.concat({shoe: curves[shoe] for shoe in shoes if shoe in curves}, axis=1) * scale
         if group_curves.dropna(how='all').empty:
             continue
         for shoe in group_curves.columns:
             ax.plot(group_curves.index, group_curves[shoe], color=ps.colour(index), lw=0.6, alpha=0.4)
         # Group mean only where every shoe in the group has a value (avoids jumps
         # as shoes enter/leave, e.g. when load onset becomes measurable)
-        plot_marked(ax, group_curves.index, group_curves.mean(axis=1, skipna=False), index,
-                    label=f'{group} (n={group_curves.shape[1]})')
+        group_mean = group_curves.mean(axis=1, skipna=False)
+        label = f'{group} (n={group_curves.shape[1]})'
+        if markers:
+            plot_marked(ax, group_curves.index, group_mean, index, label=label)
+        else:
+            ax.plot(group_curves.index, group_mean, color=ps.colour(index), label=label)
     if reference is not None:
         ax.axhline(reference, color='dimgrey', ls='--', lw=0.8)
     ax.set_xlim(0, last_common_cycle + 1)
@@ -378,13 +383,64 @@ if __name__ == '__main__':
     group_checkpoint_table(aim1_groups).to_csv(os.path.join(aim1_dir, 'aim1_group_checkpoints.csv'),
                                                index=False, float_format='%.4f')
 
-    # Primary outcome: normalised peak true force
+    # Primary outcome: normalised peak true force (% of cycles 21-30)
+    # No markers, legend or title (groups and details are given in the caption)
     fig, ax = plt.subplots(figsize=(ps.SINGLE_COLUMN, row_height + 0.3))
-    plot_group_curves(ax, aim1_groups, curves['peak_true_force'], 'Normalised peak true force', reference=1.0)
-    ax.set_ylim(0.6, 1.15)
-    ax.legend(loc='lower left')
-    ax.set_title('Peak true force')
+    plot_group_curves(ax, aim1_groups, curves['peak_true_force'], 'Normalised Peak Force (%)',
+                      reference=100, markers=False, scale=100)
+    ax.set_ylim(60, 115)
     save_figure(fig, os.path.join(aim1_dir, 'aim1_normalised-peak-true-force'))
+
+    # Key metrics at checkpoints: mean +/- SD across shoes in each model
+    # Each shoe's value is the median of the 50-cycle checkpoint bin (see
+    # checkpoints); points are the model mean and error bars the sample SD across
+    # shoes (n = 2-3 per model, so SD is indicative only). Normalised metrics are
+    # expressed as % of cycles 21-30; energy return is % of energy input
+    point_metrics = {
+        'peak_true_force': ('Normalised Peak Force (%)', 100),
+        'low_stiffness': ('Normalised Low-Range Stiffness (%)', 100),
+        'high_stiffness': ('Normalised High-Range Stiffness (%)', 100),
+        'energy_return': ('Energy Returned (% of Input)', 1),
+    }
+    checkpoint_cycles = {label: (start + end) / 2 for label, (start, end) in checkpoints.items()}
+    point_rows = []
+    for metric, (ylabel, scale) in point_metrics.items():
+        for group, shoes in aim1_groups.items():
+            values = shoe_checkpoints.loc[(shoe_checkpoints['outcome'] == metric) &
+                                          shoe_checkpoints['shoe'].isin(shoes)].set_index('shoe')
+            for checkpoint, (start, end) in checkpoints.items():
+                shoe_values = values.loc[shoes, checkpoint] * scale
+                point_rows.append({
+                    'metric': metric, 'label': ylabel, 'model': group, 'checkpoint': checkpoint,
+                    'cycle_bin': f'{start}-{end}', 'cycle_mid': checkpoint_cycles[checkpoint],
+                    'n': int(shoe_values.notna().sum()), 'mean': shoe_values.mean(), 'sd': shoe_values.std(ddof=1),
+                    'mean_sd': f'{shoe_values.mean():.1f} ± {shoe_values.std(ddof=1):.1f}',
+                    'shoe_values': '; '.join(f'{shoe}: {value:.2f}' for shoe, value in shoe_values.items()),
+                })
+    point_summary = pd.DataFrame(point_rows)
+    point_summary.to_csv(os.path.join(aim1_dir, 'aim1_checkpoint-mean-sd.csv'), index=False, float_format='%.3f')
+
+    # Point plot (models dodged horizontally so error bars do not overlap)
+    dodge = 45
+    fig, axes = plt.subplots(2, 2, figsize=(ps.DOUBLE_COLUMN, 2 * row_height))
+    for ax, (metric, (ylabel, scale)) in zip(axes.flat, point_metrics.items()):
+        metric_data = point_summary.loc[point_summary['metric'] == metric]
+        for index, group in enumerate(aim1_groups):
+            group_data = metric_data.loc[metric_data['model'] == group]
+            x = group_data['cycle_mid'] + (index - (len(aim1_groups) - 1) / 2) * dodge
+            ax.errorbar(x, group_data['mean'], yerr=group_data['sd'], color=ps.colour(index),
+                        marker=ps.marker(index), markersize=4, lw=1.0, capsize=2, capthick=0.8, elinewidth=0.8,
+                        label=f'{group} (n={len(aim1_groups[group])})')
+        if scale == 100:
+            ax.axhline(100, color='dimgrey', ls='--', lw=0.8, zorder=0)
+        ax.set_xticks(list(range(0, last_common_cycle + 2, 500)))
+        ax.set_xlim(-150, last_common_cycle + 150)
+        ax.set_xlabel('Cycle')
+        ax.set_ylabel(ylabel)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper center', ncol=4, bbox_to_anchor=(0.5, 0.0))
+    fig.tight_layout()
+    save_figure(fig, os.path.join(aim1_dir, 'aim1_checkpoint-mean-sd'))
 
     # Stiffness: low and high range
     fig, axes = plt.subplots(1, 2, figsize=(ps.DOUBLE_COLUMN, row_height), sharey=True)
