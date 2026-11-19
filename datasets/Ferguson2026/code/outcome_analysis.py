@@ -483,12 +483,15 @@ if __name__ == '__main__':
     save_figure(fig, os.path.join(aim1_dir, 'aim1_energy'))
 
     # Hysteresis loops: moment vs. bend angle at first and last common cycle for
-    # each shoe, with stiffness windows highlighted and energy return annotated
-    # (solid, filled markers = cycle 21; dashed, open markers = cycle 2499)
+    # each shoe, with stiffness windows highlighted (solid = cycle 21; dashed =
+    # cycle 2499; grey bands = stiffness windows). No legends or markers; curves are
+    # described in the caption. Shoes are titled by model and number, and the
+    # y-axis is shared within each row (model)
     for groups, aim, filename in [(aim1_groups, 'aim1', 'aim1_hysteresis-loops'),
                                   (aim2_groups, 'aim2', 'aim2_hysteresis-loops')]:
         n_cols = max(len(shoes) for shoes in groups.values())
-        fig, axes = plt.subplots(len(groups), n_cols, figsize=(ps.DOUBLE_COLUMN, 2.1 * len(groups)), squeeze=False)
+        fig, axes = plt.subplots(len(groups), n_cols, figsize=(ps.DOUBLE_COLUMN, 2.1 * len(groups)),
+                                 squeeze=False, sharey='row')
         for row, (group, shoes) in enumerate(groups.items()):
             for col in range(n_cols):
                 ax = axes[row, col]
@@ -497,8 +500,7 @@ if __name__ == '__main__':
                     continue
                 shoe = shoes[col]
                 cycle_results = results[shoe].set_index('Cycle_ID')
-                for cycle, line_style, face in [(checkpoints['Start'][0], '-', ps.colour(row)),
-                                                (last_common_cycle, '--', 'white')]:
+                for cycle, line_style in [(checkpoints['Start'][0], '-'), (last_common_cycle, '--')]:
                     data = samples[shoe][cycle].copy()
                     row_results = cycle_results.loc[cycle]
                     # Correct moment for load cell zero offset
@@ -509,16 +511,13 @@ if __name__ == '__main__':
                                                                   row_results[f'{window}_Window_End'])
                         ax.plot(bending.loc[in_window, 'Bend_Angle'], bending.loc[in_window, 'Moment'],
                                 color='#9a9a9a', lw=4, alpha=0.45, solid_capstyle='round', zorder=1)
-                    ax.plot(data['Bend_Angle'], data['Moment'], color=ps.colour(row), ls=line_style, lw=1.0,
-                            marker=ps.marker(row), markersize=2.5, markevery=40, markerfacecolor=face,
-                            markeredgewidth=0.6, zorder=2,
-                            label=f'Cycle {cycle}: {row_results["Energy_Return_Percent"]:.0f}% returned')
-                ax.set_title(f'{shoe} ({group})', fontsize=8)
-                ax.set_xlabel('Bend angle (deg)')
-                ax.set_ylabel('Moment (Nm)')
+                    ax.plot(data['Bend_Angle'], data['Moment'], color=ps.colour(row), ls=line_style, lw=1.0, zorder=2)
+                ax.set_title(f'{group} {col + 1}', fontsize=8)
+                ax.set_xlabel('Bend Angle (deg)')
+                if col == 0:
+                    ax.set_ylabel('Moment (Nm)')
                 ax.set_xlim(left=0)
-                ax.set_ylim(bottom=min(0, ax.get_ylim()[0]))
-                ax.legend(loc='upper left', fontsize=6, handlelength=2.5)
+            axes[row, 0].set_ylim(bottom=min(0, axes[row, 0].get_ylim()[0]))
         fig.tight_layout()
         save_figure(fig, os.path.join(results_path, aim, filename))
 
